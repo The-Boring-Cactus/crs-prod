@@ -1,0 +1,82 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+
+    
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <ImplicitUsings>true</ImplicitUsings>
+
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <FileVersion>0.1.0.0</FileVersion>
+    <Version>0.1.0</Version>
+
+	<ServerGarbageCollection>true</ServerGarbageCollection>
+
+  </PropertyGroup>
+
+  <ItemGroup>
+
+    <PackageReference Include="Dapper" Version="2.1.66" />
+
+    <PackageReference Include="MailKit" Version="4.17.0" />
+
+    <PackageReference Include="Npgsql" Version="9.0.3" />
+
+    <PackageReference Include="MySqlConnector" Version="2.4.0" />
+
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.1.1" />
+
+    <PackageReference Include="Oracle.ManagedDataAccess.Core" Version="23.26.200" />
+
+    <PackageReference Include="GenHTTP.Core" Version="9.8.0" />
+
+    <PackageReference Include="GenHTTP.Modules.ApiBrowsing" Version="9.8.0" />
+
+    <PackageReference Include="GenHTTP.Modules.OpenApi" Version="9.8.0" />
+
+    <PackageReference Include="GenHTTP.Modules.StaticWebsites" Version="9.8.0" />
+
+    <PackageReference Include="GenHTTP.Modules.Webservices" Version="9.8.0" />
+
+    <PackageReference Include="GenHTTP.Modules.Websockets" Version="9.8.0" />
+
+    <PackageReference Include="Jint" Version="4.4.1" />
+
+    <PackageReference Include="MathNet.Numerics" Version="6.0.0-beta2" />
+
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.14.0" />
+
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.0-preview.7.25380.108" />
+
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+
+  </ItemGroup>
+
+<ItemGroup>
+        <!-- Resources lives at the repo root (../Resources relative to this project).
+             In development the server is run from the repo root so it finds Resources/
+             via working directory. For publish, we copy the folder into the output. -->
+        <Content Include="..\Resources\**\*">
+            <Link>Resources\%(RecursiveDir)%(Filename)%(Extension)</Link>
+            <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+            <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        </Content>
+</ItemGroup>
+
+<ItemGroup>
+  <ProjectReference Include="..\DataTableFunctions\DataTableFunctions.csproj" />
+  <ProjectReference Include="..\DateTimeFunctions\DateTimeFunctions.csproj" />
+  <ProjectReference Include="..\DoeFunctions\DoeFunctions.csproj" />
+  <ProjectReference Include="..\FinancialFunctions\FinancialFunctions.csproj" />
+  <ProjectReference Include="..\MathFunctions\MathFunctions.csproj" />
+  <ProjectReference Include="..\FunctEngine\FunctEngine.csproj" />
+  <ProjectReference Include="..\StringUtilities\StringUtilities.csproj" />
+  <ProjectReference Include="..\TimeSeriesFunctions\TimeSeriesFunctions.csproj" />
+  <ProjectReference Include="..\NonParametricFunctions\NonParametricFunctions.csproj" />
+  <ProjectReference Include="..\DistributionFunctions\DistributionFunctions.csproj" />
+</ItemGroup>
+
+</Project>

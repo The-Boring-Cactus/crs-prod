@@ -1,0 +1,102 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace FunctEngine
+{
+    public class CodeEngine : IDisposable
+    {
+        private Dictionary<string, object> variables = new Dictionary<string, object>();
+        private Dictionary<string, int> counters = new Dictionary<string, int>();
+        private readonly FunctionManager functionManager;
+        private readonly DatabaseManager databaseManager;
+        public string connectionId = string.Empty;
+        // Variables para estadísticas de texto
+        private int totalWordsProcessed = 0;
+        private int totalTextsAnalyzed = 0;
+
+        public List<string> GetFunctions()
+        {
+            return functionManager.GetFunctionNames();
+        }
+        public CodeEngine(string connectionId)
+        {
+            functionManager = new FunctionManager(variables, counters, this);
+            databaseManager = new DatabaseManager(this);
+            functionManager.SetDatabaseManager(databaseManager);
+            functionManager.InitializeBuiltInFunctions();
+            this.connectionId = connectionId;
+        }
+
+        // Propiedades públicas para acceso a estadísticas
+        public int TotalWordsProcessed => totalWordsProcessed;
+        public int TotalTextsAnalyzed => totalTextsAnalyzed;
+
+        public event StatusUpdateHandler StatusUpdate;
+        public delegate void OutputEmittedHandler(object sender, OutputEmittedEventArgs e);
+        public event OutputEmittedHandler OutputEmitted;
+
+        public void PrintCore(string msg)
+        {
+            if(StatusUpdate != null)
+            {
+                var e = new StatusString(msg, connectionId);
+                StatusUpdate(this, e);
+            }
+        }
+
+        public void EmitOutput(string outputType, object payload)
+        {
+            OutputEmitted?.Invoke(this, new OutputEmittedEventArgs(outputType, payload, connectionId));
+        }
+        public void IncrementTextStats(int words)
+        {
+            totalWordsProcessed += words;
+            totalTextsAnalyzed++;
+        }
+
+        // Cargar funciones desde DLL externa
+        public void LoadExternalDll(string dllPath)
+        {
+            functionManager.LoadExternalDll(dllPath);
+        }
+
+        // Registrar una función externa manualmente
+        public void RegisterExternalFunction(string name, Func<object[], object> function)
+        {
+            functionManager.RegisterExternalFunction(name, function);
+        }
+
+        public void RegisterDatabaseConnection(string name, System.Data.IDbConnection connection)
+        {
+            databaseManager.RegisterConnection(name, connection);
+        }
+
+        public List<object> ExecuteDatabaseQuery(string connectionName, string query)
+        {
+            return databaseManager.ExecuteQuery(connectionName, query);
+        }
+
+        // Parsear y ejecutar el código
+        public void Execute(string code)
+        {
+            variables = new Dictionary<string, object>();
+            counters = new Dictionary<string, int>();
+            var tokenizer = new Tokenizer();
+            var tokens = tokenizer.Tokenize(code);
+
+            var parser = new Parser(tokens);
+            var ast = parser.Parse(this);
+
+            var executor = new StatementExecutor(variables, functionManager);
+            executor.ExecuteStatements(ast.Statements);
+        }
+
+        public void Dispose()
+        {
+            databaseManager?.Dispose();
+        }
+    }
+}

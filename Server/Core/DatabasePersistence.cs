@@ -1,0 +1,503 @@
+using System.Data.Common;
+using Dapper;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+
+namespace Server.Core;
+
+/// <summary>
+/// Provides entity CRUD persistence against the user-configured database (MSSQL, Postgres, MySQL).
+/// Replaces the former RocksDB-based LoadEntityData/SaveEntityData pattern.
+/// </summary>
+public static class DatabasePersistence
+{
+    /// <summary>
+    /// Creates a new DbConnection from the setup config.
+    /// Returns null if the system is not yet configured.
+    /// </summary>
+    public static DbConnection CreateConnection()
+    {
+        var config = SetupConfig.Load();
+        if (!config.IsConfigured || config.Database == null)
+            return null;
+
+        var cs = config.Database.GetConnectionString();
+        return config.Database.Type?.ToLower() switch
+        {
+            "mssql" => new Microsoft.Data.SqlClient.SqlConnection(cs),
+            "postgresql" => new Npgsql.NpgsqlConnection(cs),
+            "mysql" => new MySqlConnector.MySqlConnection(cs),
+            "oracle" => CreateOracleConnection(cs),
+            _ => null
+        };
+    }
+
+    // Reflection-based Oracle loader — avoids direct type reference so the Oracle
+    // assembly is only loaded when an Oracle connection is actually requested.
+    private static DbConnection CreateOracleConnection(string cs)
+    {
+        try
+        {
+            var asm = System.Reflection.Assembly.Load("Oracle.ManagedDataAccess");
+            var type = asm.GetType("Oracle.ManagedDataAccess.Client.OracleConnection", throwOnError: true)!;
+            return (DbConnection)Activator.CreateInstance(type, cs)!;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException(
+                "Oracle.ManagedDataAccess assembly failed to load: " + ex.Message +
+                ". Ensure Oracle.ManagedDataAccess.Core NuGet package is deployed.", ex);
+        }
+    }
+
+    // Checks by type name so no direct Oracle assembly reference is needed.
+    internal static bool IsOracleConnection(DbConnection conn)
+        => conn?.GetType().FullName?.StartsWith("Oracle.") == true;
+
+    // ── Generic JSON entity operations ──────────────────────────────────
+    // Each "entity table" stores rows as JSON blobs in a dedicated table,
+    // keyed by (UserId, Id).  The tables were created during setup.
+
+    // ── Scripts (SqlScripts + CodeScripts combined) ─────────────────────
+
+    public static List<JObject> LoadScripts(string userId, string language, string projectId = null)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return new List<JObject>();
+
+        conn.Open();
+        string tableName = language == "csharp" ? "CodeScripts" : "SqlScripts";
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+
+        IEnumerable<dynamic> rows;
+        if (!string.IsNullOrEmpty(projectId))
+        {
+            object dbProjId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? projectId : Guid.Parse(projectId);
+            rows = conn.Query($"SELECT * FROM {tableName} WHERE UserId = @UserId AND ProjectId = @ProjectId",
+                new { UserId = dbUserId, ProjectId = dbProjId });
+        }
+        else
+        {
+            rows = conn.Query($"SELECT * FROM {tableName} WHERE UserId = @UserId", new { UserId = dbUserId });
+        }
+        return rows.Select(r => JObject.Parse(JsonConvert.SerializeObject(r))).Cast<JObject>().ToList();
+    }
+
+    public static void SaveScript(string userId, JObject scriptObj, string language)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return;
+
+        conn.Open();
+        var id = scriptObj["id"]?.ToString() ?? scriptObj["Id"]?.ToString();
+        if (string.IsNullOrEmpty(id))
+        {
+            id = Guid.NewGuid().ToString();
+            scriptObj["id"] = id;
+        }
+
+        var name = scriptObj["name"]?.ToString() ?? scriptObj["Name"]?.ToString() ?? "Untitled";
+        var code = scriptObj["code"]?.ToString() ?? scriptObj["Code"]?.ToString() ?? "";
+        var dbConnId = scriptObj["database"]?.ToString() ?? scriptObj["DatabaseConnectionId"]?.ToString() ?? "";
+        var projIdStr = scriptObj["projectId"]?.ToString() ?? scriptObj["ProjectId"]?.ToString();
+
+        object dbId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? id : Guid.Parse(id);
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+        object dbProjId = string.IsNullOrEmpty(projIdStr) ? null :
+            ((conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? (object)projIdStr : Guid.Parse(projIdStr));
+
+        if (language == "csharp")
+        {
+            conn.Execute(@"DELETE FROM CodeScripts WHERE Id = @Id AND UserId = @UserId",
+                new { Id = dbId, UserId = dbUserId });
+            conn.Execute(@"INSERT INTO CodeScripts (Id, UserId, Name, Language, Code, ProjectId)
+                          VALUES (@Id, @UserId, @Name, @Language, @Code, @ProjectId)",
+                new { Id = dbId, UserId = dbUserId, Name = name, Language = language, Code = code, ProjectId = dbProjId });
+        }
+        else
+        {
+            var visualizationStr = scriptObj["visualization"]?.ToString() ?? scriptObj["Visualization"]?.ToString();
+            conn.Execute(@"DELETE FROM SqlScripts WHERE Id = @Id AND UserId = @UserId",
+                new { Id = dbId, UserId = dbUserId });
+            conn.Execute(@"INSERT INTO SqlScripts (Id, UserId, Name, Language, Code, DatabaseConnectionId, ProjectId, Visualization)
+                          VALUES (@Id, @UserId, @Name, @Language, @Code, @DatabaseConnectionId, @ProjectId, @Visualization)",
+                new { Id = dbId, UserId = dbUserId, Name = name, Language = language, Code = code, DatabaseConnectionId = dbConnId, ProjectId = dbProjId, Visualization = visualizationStr });
+        }
+    }
+
+    public static void DeleteScript(string userId, string id, string language)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return;
+
+        conn.Open();
+        object dbId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? id : Guid.Parse(id);
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+        
+        string tableName = language == "csharp" ? "CodeScripts" : "SqlScripts";
+        conn.Execute($"DELETE FROM {tableName} WHERE Id = @Id AND UserId = @UserId",
+            new { Id = dbId, UserId = dbUserId });
+    }
+
+    // ── DatabaseConnections ─────────────────────────────────────────────
+
+    public static List<JObject> LoadDatabaseConnections(string userId, string projectId = null)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return new List<JObject>();
+
+        conn.Open();
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+
+        IEnumerable<dynamic> rows;
+        if (!string.IsNullOrEmpty(projectId))
+        {
+            object dbProjId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? projectId : Guid.Parse(projectId);
+            rows = conn.Query("SELECT * FROM DatabaseConnections WHERE (UserId = @UserId AND ProjectId = @ProjectId) OR (UserId = @UserId AND ProjectId IS NULL) OR IsGlobal = @True",
+                new { UserId = dbUserId, ProjectId = dbProjId, True = true });
+        }
+        else
+        {
+            rows = conn.Query("SELECT * FROM DatabaseConnections WHERE UserId = @UserId OR IsGlobal = @True",
+                new { UserId = dbUserId, True = true });
+        }
+        return rows.Select(r => JObject.Parse(JsonConvert.SerializeObject(r))).Cast<JObject>().ToList();
+    }
+
+    public static void SaveDatabaseConnection(string userId, JObject connObj)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return;
+
+        conn.Open();
+        var id = connObj["id"]?.ToString() ?? connObj["Id"]?.ToString();
+        if (string.IsNullOrEmpty(id))
+        {
+            id = Guid.NewGuid().ToString();
+            connObj["id"] = id;
+        }
+
+        object dbId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? id : Guid.Parse(id);
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+
+        var projIdStr = connObj["projectId"]?.ToString() ?? connObj["ProjectId"]?.ToString();
+        object dbProjId = string.IsNullOrEmpty(projIdStr) ? null :
+            ((conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? (object)projIdStr : Guid.Parse(projIdStr));
+
+        conn.Execute("DELETE FROM DatabaseConnections WHERE Id = @Id AND UserId = @UserId",
+            new { Id = dbId, UserId = dbUserId });
+
+        conn.Execute(@"INSERT INTO DatabaseConnections
+            (Id, UserId, Name, Type, Host, Port, DatabaseName, Username, Password, ConnectionString, IsGlobal, SharedWith, ProjectId)
+            VALUES (@Id, @UserId, @Name, @Type, @Host, @Port, @DatabaseName, @Username, @Password, @ConnectionString, @IsGlobal, @SharedWith, @ProjectId)",
+            new
+            {
+                Id = dbId,
+                UserId = dbUserId,
+                Name = connObj["name"]?.ToString() ?? connObj["Name"]?.ToString() ?? "",
+                Type = connObj["type"]?.ToString() ?? connObj["Type"]?.ToString() ?? "",
+                Host = connObj["host"]?.ToString() ?? connObj["Host"]?.ToString() ?? "",
+                Port = (int)(connObj["port"] ?? connObj["Port"] ?? 0),
+                DatabaseName = connObj["database"]?.ToString() ?? connObj["DatabaseName"]?.ToString() ?? "",
+                Username = connObj["username"]?.ToString() ?? connObj["Username"]?.ToString() ?? "",
+                Password = connObj["password"]?.ToString() ?? connObj["Password"]?.ToString() ?? "",
+                ConnectionString = connObj["connectionString"]?.ToString() ?? connObj["ConnectionString"]?.ToString() ?? "",
+                IsGlobal = (bool)(connObj["isGlobal"] ?? connObj["IsGlobal"] ?? false),
+                SharedWith = connObj["sharedWith"]?.ToString() ?? connObj["SharedWith"]?.ToString() ?? "",
+                ProjectId = dbProjId
+            });
+    }
+
+    public static void DeleteDatabaseConnection(string userId, string id)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return;
+
+        conn.Open();
+        object dbId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? id : Guid.Parse(id);
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+        
+        conn.Execute("DELETE FROM DatabaseConnections WHERE Id = @Id AND UserId = @UserId",
+            new { Id = dbId, UserId = dbUserId });
+    }
+
+    // ── Generic JSON-blob entities (Datasets, Excels, Dashboards, Reports) ──────
+
+    private static readonly HashSet<string> ShareableTables = new() { "Dashboards", "Reports" };
+
+    public static List<JObject> LoadEntities(string userId, string tableName, string projectId = null)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return new List<JObject>();
+
+        conn.Open();
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+
+        IEnumerable<dynamic> rows;
+        if (!string.IsNullOrEmpty(projectId))
+        {
+            object dbProjId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? projectId : Guid.Parse(projectId);
+            rows = conn.Query($"SELECT * FROM {tableName} WHERE UserId = @UserId AND ProjectId = @ProjectId",
+                new { UserId = dbUserId, ProjectId = dbProjId });
+        }
+        else
+        {
+            rows = conn.Query($"SELECT * FROM {tableName} WHERE UserId = @UserId", new { UserId = dbUserId });
+        }
+        return rows.Select(r => JObject.Parse(JsonConvert.SerializeObject(r))).Cast<JObject>().ToList();
+    }
+
+    // Cross-user read used by ScheduledRefreshService, which needs to scan every
+    // saved dashboard (not just one user's) to find widgets due for a background refresh.
+    public static List<JObject> LoadAllEntities(string tableName)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return new List<JObject>();
+
+        conn.Open();
+        var rows = conn.Query($"SELECT * FROM {tableName}");
+        return rows.Select(r => JObject.Parse(JsonConvert.SerializeObject(r))).Cast<JObject>().ToList();
+    }
+
+    public static void SaveEntity(string userId, string tableName, JObject obj)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return;
+
+        conn.Open();
+        var id = obj["id"]?.ToString() ?? obj["Id"]?.ToString();
+        if (string.IsNullOrEmpty(id))
+        {
+            id = Guid.NewGuid().ToString();
+            obj["id"] = id;
+        }
+
+        var name = obj["name"]?.ToString() ?? obj["Name"]?.ToString() ?? "Untitled";
+        var config = JsonConvert.SerializeObject(obj);
+
+        object dbId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? id : Guid.Parse(id);
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+
+        var projIdStr = obj["projectId"]?.ToString() ?? obj["ProjectId"]?.ToString();
+        object dbProjId = string.IsNullOrEmpty(projIdStr) ? null :
+            ((conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? (object)projIdStr : Guid.Parse(projIdStr));
+
+        conn.Execute($"DELETE FROM {tableName} WHERE Id = @Id AND UserId = @UserId",
+            new { Id = dbId, UserId = dbUserId });
+
+        if (ShareableTables.Contains(tableName))
+        {
+            var isPublic = (obj["isPublic"] ?? obj["IsPublic"])?.Value<bool>() ?? false;
+            var shareToken = (obj["shareToken"] ?? obj["ShareToken"])?.ToString();
+            conn.Execute($@"INSERT INTO {tableName} (Id, UserId, Name, Config, IsPublic, ShareToken, ProjectId)
+                            VALUES (@Id, @UserId, @Name, @Config, @IsPublic, @ShareToken, @ProjectId)",
+                new { Id = dbId, UserId = dbUserId, Name = name, Config = config, IsPublic = isPublic, ShareToken = shareToken, ProjectId = dbProjId });
+        }
+        else
+        {
+            conn.Execute($@"INSERT INTO {tableName} (Id, UserId, Name, Config, ProjectId)
+                            VALUES (@Id, @UserId, @Name, @Config, @ProjectId)",
+                new { Id = dbId, UserId = dbUserId, Name = name, Config = config, ProjectId = dbProjId });
+        }
+    }
+
+    public static void DeleteEntity(string userId, string tableName, string id)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return;
+
+        conn.Open();
+        object dbId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? id : Guid.Parse(id);
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+
+        conn.Execute($"DELETE FROM {tableName} WHERE Id = @Id AND UserId = @UserId",
+            new { Id = dbId, UserId = dbUserId });
+    }
+
+    // ── Public sharing ──────────────────────────────────────────────────
+
+    public static string GenerateShareToken(string userId, string tableName, string id)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return null;
+
+        conn.Open();
+        object dbId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? id : Guid.Parse(id);
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+
+        var token = Guid.NewGuid().ToString("N")[..16];
+        conn.Execute($"UPDATE {tableName} SET ShareToken = @Token, IsPublic = @True WHERE Id = @Id AND UserId = @UserId",
+            new { Token = token, True = true, Id = dbId, UserId = dbUserId });
+        return token;
+    }
+
+    public static void RevokeShareToken(string userId, string tableName, string id)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return;
+
+        conn.Open();
+        object dbId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? id : Guid.Parse(id);
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+
+        conn.Execute($"UPDATE {tableName} SET ShareToken = NULL, IsPublic = @False WHERE Id = @Id AND UserId = @UserId",
+            new { False = false, Id = dbId, UserId = dbUserId });
+    }
+
+    public static JObject LoadEntityByShareToken(string tableName, string shareToken)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return null;
+
+        conn.Open();
+        var row = conn.QueryFirstOrDefault($"SELECT * FROM {tableName} WHERE ShareToken = @Token",
+            new { Token = shareToken });
+        if (row == null) return null;
+        return JObject.Parse(JsonConvert.SerializeObject(row));
+    }
+
+    // ── Reports (DB-backed UserReport) ─────────────────────────────────
+
+    public static List<JObject> LoadReports(string userId)
+        => LoadEntities(userId, "Reports");
+
+    public static void SaveReport(string userId, JObject reportObj)
+        => SaveEntity(userId, "Reports", reportObj);
+
+    public static void DeleteReport(string userId, string id)
+        => DeleteEntity(userId, "Reports", id);
+
+    // ── Projects ────────────────────────────────────────────────────────
+
+    public static void RunMigrations()
+    {
+        var config = SetupConfig.Load();
+        if (!config.IsConfigured || config.Database == null) return;
+
+        var migrationSQL = config.Database.GetMigrationSQL();
+        if (string.IsNullOrWhiteSpace(migrationSQL)) return;
+
+        bool isOracle = config.Database.Type?.ToLower() == "oracle";
+        string[] statements;
+        if (isOracle)
+            statements = migrationSQL.Split(new[] { "\n/" }, StringSplitOptions.RemoveEmptyEntries);
+        else
+            statements = migrationSQL.Split(';', StringSplitOptions.RemoveEmptyEntries);
+
+        using var conn = CreateConnection();
+        if (conn == null) return;
+        conn.Open();
+
+        foreach (var stmt in statements)
+        {
+            var trimmed = stmt.Trim();
+            if (string.IsNullOrWhiteSpace(trimmed)) continue;
+            try { conn.Execute(trimmed); }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Migration] Statement skipped (may already be applied): {ex.Message}");
+            }
+        }
+    }
+
+    public static List<JObject> LoadProjects(string userId)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return new List<JObject>();
+
+        conn.Open();
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+        var rows = conn.Query("SELECT * FROM Projects WHERE UserId = @UserId ORDER BY CreatedAt",
+            new { UserId = dbUserId });
+        return rows.Select(r => JObject.Parse(JsonConvert.SerializeObject(r))).Cast<JObject>().ToList();
+    }
+
+    public static void SaveProject(string userId, JObject projectObj)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return;
+
+        conn.Open();
+        var id = projectObj["id"]?.ToString() ?? projectObj["Id"]?.ToString();
+        if (string.IsNullOrEmpty(id)) { id = Guid.NewGuid().ToString(); projectObj["id"] = id; }
+
+        object dbId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? id : Guid.Parse(id);
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+
+        conn.Execute("DELETE FROM Projects WHERE Id = @Id AND UserId = @UserId", new { Id = dbId, UserId = dbUserId });
+        conn.Execute("INSERT INTO Projects (Id, UserId, Name, Description) VALUES (@Id, @UserId, @Name, @Description)",
+            new
+            {
+                Id = dbId,
+                UserId = dbUserId,
+                Name = projectObj["name"]?.ToString() ?? projectObj["Name"]?.ToString() ?? "Untitled",
+                Description = projectObj["description"]?.ToString() ?? projectObj["Description"]?.ToString() ?? ""
+            });
+    }
+
+    public static void DeleteProject(string userId, string id)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return;
+
+        conn.Open();
+        object dbId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? id : Guid.Parse(id);
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+        conn.Execute("DELETE FROM Projects WHERE Id = @Id AND UserId = @UserId", new { Id = dbId, UserId = dbUserId });
+    }
+
+    // ── Variables ────────────────────────────────────────────────────────────────
+
+    public static List<JObject> LoadVariables(string userId, string projectId = null)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return new List<JObject>();
+        conn.Open();
+        // Variables table uses VARCHAR(36) in all databases — pass strings, not Guid objects.
+        IEnumerable<dynamic> rows;
+        if (!string.IsNullOrEmpty(projectId))
+        {
+            rows = conn.Query("SELECT * FROM Variables WHERE UserId = @UserId AND (ProjectId = @ProjectId OR ProjectId IS NULL)",
+                new { UserId = userId, ProjectId = projectId });
+        }
+        else
+        {
+            rows = conn.Query("SELECT * FROM Variables WHERE UserId = @UserId", new { UserId = userId });
+        }
+        return rows.Select(r => JObject.Parse(JsonConvert.SerializeObject(r))).Cast<JObject>().ToList();
+    }
+
+    public static void SaveVariable(string userId, JObject varObj)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return;
+        conn.Open();
+        var id = varObj["id"]?.ToString() ?? varObj["Id"]?.ToString();
+        if (string.IsNullOrEmpty(id)) { id = Guid.NewGuid().ToString(); varObj["id"] = id; }
+        // Variables table uses VARCHAR(36) in all databases — pass strings, not Guid objects.
+        var projIdStr = varObj["projectId"]?.ToString() ?? varObj["ProjectId"]?.ToString();
+        conn.Execute("DELETE FROM Variables WHERE Id = @Id AND UserId = @UserId", new { Id = id, UserId = userId });
+        conn.Execute(@"INSERT INTO Variables (Id, UserId, ProjectId, Name, Label, Type, DefaultValue, DropdownSource, DropdownValues, DropdownQuery, DropdownConnectionId)
+                       VALUES (@Id, @UserId, @ProjectId, @Name, @Label, @Type, @DefaultValue, @DropdownSource, @DropdownValues, @DropdownQuery, @DropdownConnectionId)",
+            new {
+                Id = id, UserId = userId, ProjectId = string.IsNullOrEmpty(projIdStr) ? null : projIdStr,
+                Name = varObj["name"]?.ToString() ?? "var",
+                Label = varObj["label"]?.ToString(),
+                Type = varObj["type"]?.ToString() ?? "input",
+                DefaultValue = varObj["defaultValue"]?.ToString(),
+                DropdownSource = varObj["dropdownSource"]?.ToString(),
+                DropdownValues = varObj["dropdownValues"]?.ToString(),
+                DropdownQuery = varObj["dropdownQuery"]?.ToString(),
+                DropdownConnectionId = varObj["dropdownConnectionId"]?.ToString()
+            });
+    }
+
+    public static void DeleteVariable(string userId, string id)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return;
+        conn.Open();
+        // Variables table uses VARCHAR(36) in all databases — pass strings, not Guid objects.
+        conn.Execute("DELETE FROM Variables WHERE Id = @Id AND UserId = @UserId", new { Id = id, UserId = userId });
+    }
+}
