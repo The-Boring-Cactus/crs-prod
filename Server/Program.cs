@@ -18,16 +18,14 @@ internal class Program
         var cache = new ReportsCache("report-system");
         DatabasePersistence.RunMigrations();
         ScheduledRefreshService.Start();
+        ReportScheduleWorker.Start();
         var dataSource = new DataSourceManager(cache);
         var authService = new AuthService(cache);
-        var reportsService = new UserReportsService(cache, dataSource);
-        var backgroundWorker = new ReportsBackgroundWorker(cache, reportsService);
 
-        var webSocketManager = new WebSocketManager(authService, reportsService, dataSource);
+        var webSocketManager = new WebSocketManager(authService, dataSource);
 
         var setupController = new SetupController();
         var authController = new AuthController(authService);
-        var reportsController = new ReportsController(reportsService, cache, authService);
         var publicController = new PublicController();
 
         var websocketHandler = Websocket.Create()
@@ -51,7 +49,6 @@ internal class Program
         var layout = Layout.Create()
             .Add(CorsPolicy.Permissive())
             .Add("/srv", websocketHandler)
-            .Add("/api/reports", ServiceResource.From(reportsController).Build())
             .Add("/api/auth", ServiceResource.From(authController).Build())
             .Add("/api/setup", ServiceResource.From(setupController).Build())
             .Add("/api/public", ServiceResource.From(publicController).Build())
@@ -69,7 +66,6 @@ internal class Program
 
         _ = await builder.Console().Bind(IPAddress.Any, port).RunAsync();
 
-        backgroundWorker.Dispose();
         cache.Dispose();
     }
 }

@@ -89,9 +89,57 @@ function bokehJsonFor(output) {
     return buildBokehJson({
         type: chartTypeMap[output.payload.chartType] || 'bar',
         labels: output.payload.labels,
-        datasets: output.payload.datasets,
+        datasets: chartDataFor(output).datasets,
         title: output.payload.title
     });
+}
+
+// Per-series color overrides picked from the swatches on a Chart output card,
+// keyed by "<outputId>-<seriesIndex>". Chart()/snippet-generated series have
+// no color of their own (see FunctEngine's Chart() colors argument), so this
+// lets a series be recolored after the fact without re-running the script.
+const chartColorOverrides = reactive({});
+
+// Chart types where each dataset is its own distinct series (bar/line/area/...).
+// Pie-family charts color by category instead, so per-series swatches don't apply.
+const SERIES_COLORABLE_TYPES = ['bar', 'bar-h', 'line', 'area', 'radar', 'scatter', 'bubble', 'mixed', 'waterfall'];
+function isSeriesColorable(chartType) {
+    return SERIES_COLORABLE_TYPES.includes(chartTypeMap[chartType] || chartType);
+}
+
+function seriesColorKey(output, index) {
+    return `${output.id}-${index}`;
+}
+
+// Distinct default hues shown in the swatches, matching BaseChart's fallback
+// palette for multi-series charts so the swatch reflects what's on screen.
+const DEFAULT_SERIES_PALETTE = ['#6366f1', '#f43f5e', '#10b981', '#f59e0b', '#06b6d4', '#a855f7', '#ec4899', '#84cc16', '#3b82f6', '#f97316'];
+
+function seriesColorFor(output, index) {
+    const key = seriesColorKey(output, index);
+    if (chartColorOverrides[key]) return chartColorOverrides[key];
+    const ds = output.payload.datasets?.[index];
+    if (ds?.backgroundColor && typeof ds.backgroundColor === 'string') return ds.backgroundColor;
+    return DEFAULT_SERIES_PALETTE[index % DEFAULT_SERIES_PALETTE.length];
+}
+
+function setSeriesColor(output, index, color) {
+    chartColorOverrides[seriesColorKey(output, index)] = color;
+}
+
+function resetSeriesColor(output, index) {
+    delete chartColorOverrides[seriesColorKey(output, index)];
+}
+
+// Applies any manual swatch overrides on top of the script-emitted datasets
+// before handing them to BaseChart.
+function chartDataFor(output) {
+    const datasets = (output.payload.datasets || []).map((ds, i) => {
+        const key = seriesColorKey(output, i);
+        if (!chartColorOverrides[key]) return ds;
+        return { ...ds, backgroundColor: chartColorOverrides[key], borderColor: chartColorOverrides[key] };
+    });
+    return { labels: output.payload.labels, datasets };
 }
 
 // Editor state
@@ -611,7 +659,7 @@ const functionCategories = [
         name: 'Output', badge: 'bg-pink-100 text-pink-800',
         fns: [
             { sig: 'Table(data[, title])', desc: 'Render query results as a table widget' },
-            { sig: 'Chart(type, labels, values[, title])', desc: 'Render a chart — type: "bar" | "line" | "pie" | "doughnut" | "area" | "radar" | "scatter"' },
+            { sig: 'Chart(type, labels, values[, title[, colors]])', desc: 'Render a chart — type: "bar" | "line" | "pie" | "doughnut" | "area" | "radar" | "scatter". colors: optional array of "#rrggbb" strings, one per series (or per category for single-series charts) — also editable from swatches on the chart itself' },
             { sig: 'StatReport(title, data)', desc: 'Render a formatted statistical report' },
         ]
     },
@@ -868,14 +916,18 @@ Table(rows, 'Employee Directory');`
             },
             {
                 name: 'Chart Output',
-                description: 'Single-series and multi-series charts',
+                description: 'Single-series, multi-series, and custom-colored charts',
                 code: `// Output: single-series and multi-series charts
 var months = Array('Jan', 'Feb', 'Mar', 'Apr', 'May');
 var revenue = Array(12000, 15000, 14000, 18000, 21000);
 Chart('line', months, revenue, 'Monthly Revenue');
 
 var costs = Array(8000, 9000, 8500, 10000, 11000);
-Chart('bar', months, Array(revenue, costs), 'Revenue vs. Costs');`
+Chart('bar', months, Array(revenue, costs), 'Revenue vs. Costs');
+
+// Optional 5th argument: one color per series, so they stay easy to tell
+// apart (also editable from the swatches shown on the chart itself).
+Chart('bar', months, Array(revenue, costs), 'Revenue vs. Costs (custom colors)', Array('#10b981', '#f43f5e'));`
             },
             {
                 name: 'StatReport Output',
@@ -2301,6 +2353,19 @@ onUnmounted(() => {
                             >Bokeh</button>
                         </div>
                     </div>
+                    <div v-if="isSeriesColorable(output.payload.chartType) && output.payload.datasets?.length"
+                         class="flex flex-wrap items-center gap-x-3 gap-y-1 mb-2">
+                        <div v-for="(ds, si) in output.payload.datasets" :key="si" class="inline-flex items-center gap-1">
+                            <input
+                                type="color"
+                                class="w-4 h-4 p-0 border rounded cursor-pointer bg-transparent"
+                                :value="seriesColorFor(output, si)"
+                                @input="setSeriesColor(output, si, $event.target.value)"
+                                @dblclick="resetSeriesColor(output, si)"
+                                :title="`Series color for ${ds.label || `Series ${si + 1}`} (double-click to reset)`" />
+                            <span class="text-xs text-muted-foreground">{{ ds.label || `Series ${si + 1}` }}</span>
+                        </div>
+                    </div>
                     <div class="h-64">
                         <BokehChart
                             v-if="output.renderEngine === 'bokeh' && isBokehSupported(output.payload.chartType)"
@@ -2312,7 +2377,7 @@ onUnmounted(() => {
                         <BaseChart
                             v-else
                             :type="chartTypeMap[output.payload.chartType] || 'bar'"
-                            :data="{ labels: output.payload.labels, datasets: output.payload.datasets }"
+                            :data="chartDataFor(output)"
                             :title="output.payload.title"
                             :show-header="false"
                             :show-footer="false"

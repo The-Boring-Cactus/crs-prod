@@ -366,9 +366,15 @@ const chartOptions = computed(() => {
 
     const cardBg = isDark ? '#18181b' : '#ffffff';
 
+    // A single series reads well in the theme's accent color, but shading one
+    // hue across several series makes them nearly impossible to tell apart --
+    // so once there's more than one series, fall back to the same distinct,
+    // vivid hue set used for pie/doughnut/polar-area categories.
+    const defaultSeriesPalette = datasets.length > 1 ? CATEGORICAL_PALETTE : activePalette;
+
     datasets.forEach((ds, idx) => {
         let dsType = ds.type || type;
-        const color = ds.backgroundColor || activePalette[idx % activePalette.length];
+        const color = ds.backgroundColor || defaultSeriesPalette[idx % defaultSeriesPalette.length];
         const lineColor = ds.borderColor || color;
         const pLabel = ds.label || `Series ${idx + 1}`;
         const soloColor = Array.isArray(color) ? color[0] : color;

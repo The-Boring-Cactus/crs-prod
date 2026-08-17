@@ -9,7 +9,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
-import { BarChart, Home, Database, FileSpreadsheet, Code, FileCode2, LogOut, Search, Settings, Bell, AlignRight, FileText, ChevronRight, ChevronDown, Pencil, Plus, Trash2, Sun, Moon, Palette, Check, Eye, EyeOff, X, Network } from 'lucide-vue-next';
+import { BarChart, Home, Database, FileSpreadsheet, Code, FileCode2, LogOut, Search, Settings, Bell, AlignRight, FileText, ChevronRight, ChevronDown, Pencil, Plus, Trash2, Sun, Moon, Palette, Check, Eye, EyeOff, X, Network, UserPlus, Loader2 } from 'lucide-vue-next';
 import { useLayout } from '@/layout/composables/layout';
 import { APP_NAME } from '@/config/brand';
 
@@ -45,7 +45,7 @@ const showSettings = ref(false);
 const settingsTab = ref('profile');
 const settingsTabs = computed(() => {
     const tabs = [{ id: 'profile', label: 'Profile' }, { id: 'password', label: 'Password' }];
-    if (userStore.isAdmin) tabs.push({ id: 'smtp', label: 'Email' }, { id: 'users', label: 'Users' });
+    if (userStore.isAdmin) tabs.push({ id: 'smtp', label: 'Email' }, { id: 'users', label: 'Users' }, { id: 'audit', label: 'Audit Log' });
     tabs.push({ id: 'appearance', label: 'Appearance' });
     return tabs;
 });
@@ -224,7 +224,31 @@ const toggleUserActive = async (user) => {
 watch(settingsTab, (tab) => {
     if (tab === 'smtp' && !smtpLoading.value) loadSmtpConfig();
     if (tab === 'users' && !usersLoading.value) loadUsers();
+    if (tab === 'audit' && !auditLoading.value && !auditLogEntries.value.length) loadAuditLog();
 });
+
+// Admin Audit Log: recent create/edit/delete/share activity across the instance, loaded a
+// page at a time (server does no DB-side pagination, but the UI still fetches in chunks so
+// the admin isn't stuck waiting on a giant single load as the log grows).
+const AUDIT_PAGE_SIZE = 50;
+const auditLogEntries = ref([]);
+const auditLoading = ref(false);
+const auditHasMore = ref(false);
+
+const loadAuditLog = async (loadMore = false) => {
+    auditLoading.value = true;
+    try {
+        const offset = loadMore ? auditLogEntries.value.length : 0;
+        const result = await userStore.executeCommand('ListAuditLog', { limit: AUDIT_PAGE_SIZE, offset }, proxy.$socket);
+        const rows = result?.Data || [];
+        auditLogEntries.value = loadMore ? [...auditLogEntries.value, ...rows] : rows;
+        auditHasMore.value = rows.length === AUDIT_PAGE_SIZE;
+    } catch (e) {
+        toast.error('Failed to load audit log', { description: e.message });
+    } finally {
+        auditLoading.value = false;
+    }
+};
 
 // Check if user is authenticated
 const isLoggedIn = computed(() => userStore.auth);
@@ -349,6 +373,7 @@ const selectProjectItem = (project, subItem) => {
 const openNewProject = () => {
     isEditingProject.value = false;
     editingProject.value = { id: undefined, name: '', description: '' };
+    projectMembers.value = [];
     showProjectDialog.value = true;
 };
 
@@ -356,6 +381,59 @@ const openEditProject = (project) => {
     isEditingProject.value = true;
     editingProject.value = { id: project.id, name: project.name, description: project.description };
     showProjectDialog.value = true;
+    loadProjectMembers();
+};
+
+// Project membership: grants a teammate view/edit access to everything in this project
+// (its dashboards, scripts, data models, and non-global database connections). Only the
+// project's owner (or an admin) can manage this -- enforced server-side.
+const projectMembers = ref([]);
+const loadingProjectMembers = ref(false);
+const memberQuery = ref('');
+const memberPermission = ref('view');
+const addingMember = ref(false);
+
+const loadProjectMembers = async () => {
+    if (!editingProject.value.id) { projectMembers.value = []; return; }
+    loadingProjectMembers.value = true;
+    try {
+        const result = await userStore.executeCommand('ListResourceGrants',
+            { resourceType: 'Projects', resourceId: editingProject.value.id }, proxy.$socket);
+        projectMembers.value = result?.Data || [];
+    } catch {
+        projectMembers.value = [];
+    } finally {
+        loadingProjectMembers.value = false;
+    }
+};
+
+const addProjectMember = async () => {
+    if (!memberQuery.value.trim() || !editingProject.value.id) return;
+    addingMember.value = true;
+    try {
+        await userStore.executeCommand('ShareResource', {
+            resourceType: 'Projects', resourceId: editingProject.value.id,
+            grantee: memberQuery.value.trim(), permission: memberPermission.value
+        }, proxy.$socket);
+        memberQuery.value = '';
+        await loadProjectMembers();
+        toast.success('Member added');
+    } catch (error) {
+        toast.error('Failed to add member', { description: error.message });
+    } finally {
+        addingMember.value = false;
+    }
+};
+
+const removeProjectMember = async (granteeUserId) => {
+    try {
+        await userStore.executeCommand('RevokeResourceGrant',
+            { resourceType: 'Projects', resourceId: editingProject.value.id, granteeUserId }, proxy.$socket);
+        await loadProjectMembers();
+        toast.success('Member removed');
+    } catch (error) {
+        toast.error('Failed to remove member', { description: error.message });
+    }
 };
 
 const saveProject = async () => {
@@ -621,6 +699,34 @@ const deleteProject = async (id) => {
                         <Label class="text-zinc-400 text-xs mb-1 block">Description</Label>
                         <Input v-model="editingProject.description" placeholder="Optional description" class="bg-zinc-900 border-zinc-800 text-zinc-100" />
                     </div>
+
+                    <div v-if="isEditingProject" class="border-t border-zinc-800 pt-3 mt-1">
+                        <Label class="text-zinc-400 text-xs mb-1 block">Members (see everything in this project)</Label>
+                        <div class="flex gap-1.5">
+                            <Input v-model="memberQuery" placeholder="Username or email" class="bg-zinc-900 border-zinc-800 text-zinc-100 text-sm" @keyup.enter="addProjectMember" />
+                            <select v-model="memberPermission" class="h-9 rounded-md border border-zinc-800 bg-zinc-900 text-zinc-100 px-2 text-sm">
+                                <option value="view">Can view</option>
+                                <option value="edit">Can edit</option>
+                            </select>
+                            <Button variant="outline" size="icon" class="border-zinc-800 shrink-0" @click="addProjectMember" :disabled="!memberQuery.trim() || addingMember" title="Add member">
+                                <Loader2 v-if="addingMember" class="w-4 h-4 animate-spin" /><UserPlus v-else class="w-4 h-4" />
+                            </Button>
+                        </div>
+                        <div v-if="projectMembers.length" class="space-y-1 mt-2">
+                            <div v-for="member in projectMembers" :key="member.granteeUserId || member.GranteeUserId"
+                                 class="flex items-center justify-between text-xs bg-zinc-900 rounded px-2 py-1.5">
+                                <div class="min-w-0 truncate">
+                                    <span class="font-medium">{{ member.fullName || member.FullName || member.username || member.Username }}</span>
+                                    <span class="text-zinc-500 ml-1">({{ member.permission || member.Permission }})</span>
+                                </div>
+                                <button class="text-zinc-500 hover:text-red-400 shrink-0 ml-2" @click="removeProjectMember(member.granteeUserId || member.GranteeUserId)" title="Remove member">
+                                    <X class="w-3.5 h-3.5" />
+                                </button>
+                            </div>
+                        </div>
+                        <p v-else-if="!loadingProjectMembers" class="text-xs text-zinc-500 mt-2">No members yet -- just you.</p>
+                    </div>
+
                     <div class="flex gap-2 mt-2">
                         <Button class="flex-1" @click="saveProject">Save</Button>
                         <Button variant="outline" class="flex-1" @click="showProjectDialog = false">Cancel</Button>
@@ -806,6 +912,32 @@ const deleteProject = async (id) => {
                         </div>
                     </div>
                     <p v-if="!usersList.length" class="text-sm text-muted-foreground text-center py-4">No users found.</p>
+                </div>
+            </div>
+
+            <!-- Audit Log tab -->
+            <div v-if="settingsTab === 'audit'" class="space-y-3">
+                <p class="text-xs text-muted-foreground">Recent create/edit/delete/share activity across the instance, newest first.</p>
+                <div v-if="auditLoading && !auditLogEntries.length" class="text-sm text-muted-foreground py-4 text-center">Loading...</div>
+                <div v-else class="space-y-1.5 max-h-96 overflow-y-auto custom-scrollbar">
+                    <div v-for="entry in auditLogEntries" :key="entry.id || entry.Id" class="border rounded-md p-2.5 text-xs">
+                        <div class="flex items-center justify-between gap-2">
+                            <span class="font-medium truncate">{{ entry.username || entry.Username || 'Unknown user' }}</span>
+                            <span class="text-muted-foreground shrink-0">{{ new Date(entry.createdAt || entry.CreatedAt).toLocaleString() }}</span>
+                        </div>
+                        <p class="text-muted-foreground mt-0.5">
+                            <span class="capitalize">{{ entry.action || entry.Action }}</span>
+                            <template v-if="entry.resourceType || entry.ResourceType">
+                                — {{ entry.resourceType || entry.ResourceType }}<span v-if="entry.resourceName || entry.ResourceName">: {{ entry.resourceName || entry.ResourceName }}</span>
+                            </template>
+                            <template v-if="entry.details || entry.Details"> ({{ entry.details || entry.Details }})</template>
+                        </p>
+                    </div>
+                    <p v-if="!auditLogEntries.length" class="text-sm text-muted-foreground text-center py-4">No activity recorded yet.</p>
+                    <button v-if="auditHasMore" @click="loadAuditLog(true)" :disabled="auditLoading"
+                            class="w-full text-xs text-center py-2 text-primary hover:underline disabled:opacity-50">
+                        {{ auditLoading ? 'Loading...' : 'Load more' }}
+                    </button>
                 </div>
             </div>
 

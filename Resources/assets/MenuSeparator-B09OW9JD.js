@@ -1,1 +1,0 @@
-import{M as t,o,q as s,w as n,a5 as p,a7 as u,g as l,ab as i}from"./index-CUDAHxWB.js";var _=t({__name:"MenuSeparator",props:{asChild:{type:Boolean,required:!1},as:{type:null,required:!1}},setup(e){const a=e;return(r,d)=>(s(),o(l(i),u(a,{role:"separator","aria-orientation":"horizontal"}),{default:n(()=>[p(r.$slots,"default")]),_:3},16))}}),c=_;export{c as M};

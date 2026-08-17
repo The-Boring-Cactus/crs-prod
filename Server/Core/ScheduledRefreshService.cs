@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using Dapper;
 using Newtonsoft.Json.Linq;
 
 namespace Server.Core;
@@ -11,7 +10,13 @@ namespace Server.Core;
 // available (via GetWidgetCache) even to a public/shared viewer who opens the
 // dashboard between scheduled ticks.
 //
-// The cache is in-memory only and is cleared on restart -- that's an acceptable
+// This "outer" cache (_cache below, keyed by dashboardId:widgetId) is what enforces each
+// widget's own refreshIntervalMinutes and what GetWidgetCache reads -- that contract is
+// unchanged. What DOES query the database on a tick now goes through HeadlessQueryExecutor's
+// RunQueryCachedAsync, backed by the same ReportsCache the authenticated ExecuteSql path
+// uses, so an identical query already run elsewhere is reused instead of re-hitting the DB.
+//
+// The outer cache is in-memory only and is cleared on restart -- that's an acceptable
 // tradeoff for a freshness cache: on restart it's simply empty until the next tick,
 // and callers fall back to a live query when nothing is cached yet (same behavior
 // as before this existed).
@@ -33,6 +38,7 @@ public static class ScheduledRefreshService
     private static readonly ConcurrentDictionary<string, CachedResult> _cache = new();
     private static Timer _timer;
     private static readonly TimeSpan TickInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan DedupWindow = TimeSpan.FromMinutes(1);
 
     public static void Start()
     {
@@ -106,61 +112,19 @@ public static class ScheduledRefreshService
 
                 try
                 {
-                    var (rows, columns) = RunHeadlessQuery(connInfo, sqlCode);
-                    _cache[cacheKey] = new CachedResult { Rows = rows, Columns = columns, RefreshedAt = DateTime.UtcNow };
+                    // Routed through the same shared ReportsCache the authenticated ExecuteSql
+                    // path uses (a short dedup window, not this widget's own refresh interval --
+                    // that's already been enforced by the TryGetValue staleness check above).
+                    // If the exact same query was just run elsewhere (SQL Editor, another
+                    // widget), this tick reuses that result instead of hitting the DB again.
+                    var result = HeadlessQueryExecutor.RunQueryCachedAsync(connInfo, sqlCode, DedupWindow).GetAwaiter().GetResult();
+                    _cache[cacheKey] = new CachedResult { Rows = result.Rows, Columns = result.Columns, RefreshedAt = DateTime.UtcNow };
                 }
                 catch (Exception ex)
                 {
                     _cache[cacheKey] = new CachedResult { Rows = new(), Columns = new(), RefreshedAt = DateTime.UtcNow, Error = ex.Message };
                 }
             }
-        }
-    }
-
-    private static (List<Dictionary<string, object>> rows, List<object> columns) RunHeadlessQuery(JObject connInfo, string sql)
-    {
-        // Field lookups mirror WebSocketManager.RegisterUserDatabaseConnections: Postgres
-        // folds unquoted column names to all-lowercase (DatabaseName -> "databasename"),
-        // so the all-lowercase variant must be checked, not just camelCase/PascalCase.
-        var type = (connInfo["type"]?.ToString() ?? connInfo["Type"]?.ToString() ?? "").ToLower();
-        var host = connInfo["host"]?.ToString() ?? connInfo["Host"]?.ToString();
-        var db = connInfo["databasename"]?.ToString() ?? connInfo["database"]?.ToString() ?? connInfo["DatabaseName"]?.ToString();
-        var user = connInfo["username"]?.ToString() ?? connInfo["Username"]?.ToString();
-        var pass = connInfo["password"]?.ToString() ?? connInfo["Password"]?.ToString();
-        int.TryParse(connInfo["port"]?.ToString() ?? connInfo["Port"]?.ToString(), out int port);
-        var connectionString = connInfo["connectionstring"]?.ToString() ?? connInfo["connectionString"]?.ToString() ?? connInfo["ConnectionString"]?.ToString();
-        if (string.IsNullOrWhiteSpace(connectionString)) connectionString = null;
-
-        System.Data.IDbConnection conn = type switch
-        {
-            "mssql" => new Microsoft.Data.SqlClient.SqlConnection(
-                connectionString ?? $"Server={host},{port};Database={db};User Id={user};Password={pass};TrustServerCertificate=True;"),
-            "postgresql" => new Npgsql.NpgsqlConnection(
-                connectionString ?? $"Host={host};Port={port};Database={db};Username={user};Password={pass};"),
-            "mysql" => new MySqlConnector.MySqlConnection(
-                connectionString ?? $"Server={host};Port={port};Database={db};Uid={user};Pwd={pass};"),
-            _ => throw new InvalidOperationException($"Unsupported connection type for scheduled refresh: {type}")
-        };
-
-        using (conn)
-        {
-            conn.Open();
-            var result = conn.Query(sql);
-
-            var rows = new List<Dictionary<string, object>>();
-            var columns = new List<object>();
-            bool colsExtracted = false;
-            foreach (var row in result)
-            {
-                var rowDict = ((IDictionary<string, object>)row).ToDictionary(kv => kv.Key, kv => kv.Value);
-                if (!colsExtracted)
-                {
-                    foreach (var key in rowDict.Keys) columns.Add(new { field = key, header = key });
-                    colsExtracted = true;
-                }
-                rows.Add(rowDict);
-            }
-            return (rows, columns);
         }
     }
 }

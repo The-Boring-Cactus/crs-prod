@@ -12,14 +12,12 @@ public class WebSocketManager
 {
     private readonly ConcurrentDictionary<string, ConnectionInfo> _connections;
     private readonly IAuthService _authService;
-    private readonly IUserReportsService _reportsService;
     private readonly DataSourceManager _dataSourceManager;
 
-    public WebSocketManager(IAuthService authService, IUserReportsService reportsService, DataSourceManager dataSourceManager)
+    public WebSocketManager(IAuthService authService, DataSourceManager dataSourceManager)
     {
         _connections = new ConcurrentDictionary<string, ConnectionInfo>();
         _authService = authService;
-        _reportsService = reportsService;
         _dataSourceManager = dataSourceManager;
     }
 
@@ -375,24 +373,63 @@ public class WebSocketManager
         _ => 1
     };
 
+    // Resolves who a write to tableName/id should be persisted as, given who's actually
+    // making the call. DatabasePersistence's Save*/Delete* methods are all scoped by an
+    // owning UserId, so a collaborator with only an edit grant (not ownership) still writes
+    // under the row's real owner -- this is the one place that gets decided, rather than
+    // teaching every persistence method about grants.
+    // Returns null if the caller has neither ownership, an edit grant, nor admin rights.
+    private static string ResolveWriteOwner(string tableName, string id, string callerId, string callerRole)
+    {
+        if (string.IsNullOrEmpty(id)) return callerId; // new row: caller becomes the owner
+
+        var (ownerId, projectId) = DatabasePersistence.GetResourceOwner(tableName, id);
+        if (string.IsNullOrEmpty(ownerId)) return callerId; // row not found -- let the normal path no-op/404
+
+        if (ownerId == callerId) return callerId;
+        if (RoleLevel(callerRole) >= 2) return ownerId; // admin
+        if (DatabasePersistence.HasEditGrant(callerId, tableName, id, projectId)) return ownerId;
+        return null;
+    }
+
+    // ResourceType values accepted by ShareResource/RevokeResourceGrant/ListResourceGrants --
+    // each doubles as the real table name (see DatabasePersistence.GetResourceOwner).
+    // 'Projects' covers project membership; 'Dashboards'/'SqlScripts' cover direct,
+    // single-resource sharing.
+    private static readonly HashSet<string> GrantableResourceTypes = new(StringComparer.Ordinal)
+    {
+        "Projects", "Dashboards", "SqlScripts"
+    };
+
+    // Only the owner (or an admin) may grant/revoke/view who has access to a resource --
+    // an edit grant lets someone change the resource's content, not decide who else can.
+    private static bool CanManageSharing(string resourceType, string resourceId, string callerId, string callerRole)
+    {
+        if (RoleLevel(callerRole) >= 2) return true;
+        var (ownerId, _) = DatabasePersistence.GetResourceOwner(resourceType, resourceId);
+        return ownerId == callerId;
+    }
+
     // Commands that create/modify/delete/share saved content -- blocked for "viewer".
     private static readonly HashSet<string> EditorOrAdminCommands = new(StringComparer.Ordinal)
     {
-        "SaveScript", "DeleteScript",
+        "SaveScript", "DeleteScript", "SaveScriptSchedule", "RunScriptScheduleNow",
         "SaveDatabaseConnection", "DeleteDatabaseConnection", "TestDatabaseConnection",
         "SaveExcel", "DeleteExcel",
         "SaveDashboard", "DeleteDashboard", "ShareDashboard", "EmailShareLink",
         "SaveProject", "DeleteProject",
         "SaveVariable", "DeleteVariable",
         "SaveReport", "DeleteReport", "ShareReport",
-        "SaveDataModel", "DeleteDataModel", "ListTables"
+        "SaveDataModel", "DeleteDataModel", "ListTables",
+        "ShareResource", "RevokeResourceGrant", "ListResourceGrants"
     };
 
     // Instance-wide settings and user administration -- admin only.
     private static readonly HashSet<string> AdminOnlyCommands = new(StringComparer.Ordinal)
     {
         "GetSmtpConfig", "UpdateSmtpConfig",
-        "ListUsers", "UpdateUserRole", "SetUserActive"
+        "ListUsers", "UpdateUserRole", "SetUserActive",
+        "ListAuditLog"
     };
 
     private void CommandMessage(object sender, MessageReceivedEventArgs e)
@@ -499,10 +536,11 @@ public class WebSocketManager
                     {
                         string dbId = parameters["database"].ToString();
                         string sql = parameters["code"].ToString();
+                        bool forceRefresh = parameters.ContainsKey("forceRefresh") && Convert.ToBoolean(parameters["forceRefresh"]);
 
                         try
                         {
-                            var result = _dataSourceManager.ExecuteQueryAsync(dbId, sql).GetAwaiter().GetResult();
+                            var result = _dataSourceManager.ExecuteQueryAsync(dbId, sql, forceRefresh: forceRefresh).GetAwaiter().GetResult();
 
                             var rows = new List<Dictionary<string, object>>();
                             var columns = new List<object>();
@@ -544,7 +582,16 @@ public class WebSocketManager
                     {
                         var scriptObj = JObject.FromObject(parameters["script"]);
                         var lang = scriptObj["language"]?.ToString() ?? "sql";
-                        DatabasePersistence.SaveScript(uuid, scriptObj, lang);
+                        var scriptTable = lang == "csharp" ? "CodeScripts" : "SqlScripts";
+                        var scriptOwner = ResolveWriteOwner(scriptTable, scriptObj["id"]?.ToString(), uuid, connectionInfo.Roles);
+                        if (scriptOwner == null)
+                        {
+                            response.Status = MessageStatus.Error;
+                            response.ErrorMessage = "You don't have permission to edit this script.";
+                            break;
+                        }
+                        DatabasePersistence.SaveScript(scriptOwner, scriptObj, lang);
+                        AuditLogger.Log(uuid, connectionInfo.Username, "save", scriptTable, scriptObj["id"]?.ToString(), scriptObj["name"]?.ToString());
                     }
                     break;
 
@@ -561,9 +608,76 @@ public class WebSocketManager
                     {
                         var id = parameters["id"].ToString();
                         var lang2 = parameters.ContainsKey("language") ? parameters["language"].ToString() : "sql";
-                        DatabasePersistence.DeleteScript(uuid, id, lang2);
+                        var deleteScriptTable = lang2 == "csharp" ? "CodeScripts" : "SqlScripts";
+                        var deleteScriptOwner = ResolveWriteOwner(deleteScriptTable, id, uuid, connectionInfo.Roles);
+                        if (deleteScriptOwner == null)
+                        {
+                            response.Status = MessageStatus.Error;
+                            response.ErrorMessage = "You don't have permission to delete this script.";
+                            break;
+                        }
+                        DatabasePersistence.DeleteScript(deleteScriptOwner, id, lang2);
+                        AuditLogger.Log(uuid, connectionInfo.Username, "delete", deleteScriptTable, id);
                     }
                     break;
+
+                // Persists a SQL Editor script's scheduled-delivery config independently of
+                // SaveScript, which does a full delete+reinsert of the row -- keeping this
+                // separate means editing code and editing the schedule can't race or clobber
+                // each other in the same round trip.
+                case "SaveScriptSchedule":
+                    if (parameters.ContainsKey("id") && parameters.ContainsKey("schedule"))
+                    {
+                        var scheduleJson = JObject.FromObject(parameters["schedule"]).ToString(Formatting.None);
+                        DatabasePersistence.UpdateScriptSchedule(uuid, parameters["id"].ToString(), scheduleJson);
+                        response.Data = new { success = true };
+                    }
+                    break;
+
+                // Runs a script's query and emails it right now, using the schedule object
+                // passed from the dialog (which may be a draft the user hasn't saved yet)
+                // rather than whatever is currently persisted -- lets "send test now" reflect
+                // in-progress edits to recipients/frequency.
+                case "RunScriptScheduleNow":
+                {
+                    if (!parameters.ContainsKey("id"))
+                    {
+                        response.Status = MessageStatus.Error;
+                        response.ErrorMessage = "Missing script id";
+                        break;
+                    }
+                    var scriptId = parameters["id"].ToString();
+                    var scriptForRun = DatabasePersistence.LoadScripts(uuid, "sql")
+                        .FirstOrDefault(s => (s["id"]?.ToString() ?? s["Id"]?.ToString()) == scriptId);
+                    if (scriptForRun == null)
+                    {
+                        response.Status = MessageStatus.Error;
+                        response.ErrorMessage = "Script not found";
+                        break;
+                    }
+                    JObject scheduleForRun;
+                    if (parameters.ContainsKey("schedule"))
+                    {
+                        scheduleForRun = JObject.FromObject(parameters["schedule"]);
+                    }
+                    else
+                    {
+                        var storedSchedule = scriptForRun["schedule"]?.ToString() ?? scriptForRun["Schedule"]?.ToString();
+                        scheduleForRun = string.IsNullOrWhiteSpace(storedSchedule) ? new JObject() : JObject.Parse(storedSchedule);
+                    }
+
+                    var (success, message) = ReportScheduleWorker.RunAndDeliver(scriptForRun, scheduleForRun, persist: false);
+                    if (!success)
+                    {
+                        response.Status = MessageStatus.Error;
+                        response.ErrorMessage = message;
+                    }
+                    else
+                    {
+                        response.Data = new { message };
+                    }
+                    break;
+                }
 
                 case "SaveDatabaseConnection":
                     if (parameters.ContainsKey("connection"))
@@ -571,6 +685,7 @@ public class WebSocketManager
                         var connObj = JObject.FromObject(parameters["connection"]);
                         DatabasePersistence.SaveDatabaseConnection(uuid, connObj);
                         RegisterUserDatabaseConnections(uuid);
+                        AuditLogger.Log(uuid, connectionInfo.Username, "save", "DatabaseConnections", connObj["id"]?.ToString(), connObj["name"]?.ToString());
                     }
                     break;
 
@@ -586,6 +701,7 @@ public class WebSocketManager
                     {
                         var id = parameters["id"].ToString();
                         DatabasePersistence.DeleteDatabaseConnection(uuid, id);
+                        AuditLogger.Log(uuid, connectionInfo.Username, "delete", "DatabaseConnections", id);
                     }
                     break;
 
@@ -629,8 +745,16 @@ public class WebSocketManager
                     if (parameters.ContainsKey("dashboard"))
                     {
                         var dashObj = JObject.FromObject(parameters["dashboard"]);
-                        DatabasePersistence.SaveEntity(uuid, "Dashboards", dashObj);
+                        var dashOwner = ResolveWriteOwner("Dashboards", dashObj["id"]?.ToString(), uuid, connectionInfo.Roles);
+                        if (dashOwner == null)
+                        {
+                            response.Status = MessageStatus.Error;
+                            response.ErrorMessage = "You don't have permission to edit this dashboard.";
+                            break;
+                        }
+                        DatabasePersistence.SaveEntity(dashOwner, "Dashboards", dashObj);
                         response.Data = dashObj;
+                        AuditLogger.Log(uuid, connectionInfo.Username, "save", "Dashboards", dashObj["id"]?.ToString(), dashObj["name"]?.ToString());
                     }
                     break;
 
@@ -645,7 +769,15 @@ public class WebSocketManager
                     if (parameters.ContainsKey("id"))
                     {
                         var id = parameters["id"].ToString();
-                        DatabasePersistence.DeleteEntity(uuid, "Dashboards", id);
+                        var deleteDashOwner = ResolveWriteOwner("Dashboards", id, uuid, connectionInfo.Roles);
+                        if (deleteDashOwner == null)
+                        {
+                            response.Status = MessageStatus.Error;
+                            response.ErrorMessage = "You don't have permission to delete this dashboard.";
+                            break;
+                        }
+                        DatabasePersistence.DeleteEntity(deleteDashOwner, "Dashboards", id);
+                        AuditLogger.Log(uuid, connectionInfo.Username, "delete", "Dashboards", id);
                     }
                     break;
 
@@ -712,12 +844,17 @@ public class WebSocketManager
                         var projObj = JObject.FromObject(parameters["project"]);
                         DatabasePersistence.SaveProject(uuid, projObj);
                         response.Data = new { id = projObj["id"]?.ToString() };
+                        AuditLogger.Log(uuid, connectionInfo.Username, "save", "Projects", projObj["id"]?.ToString(), projObj["name"]?.ToString());
                     }
                     break;
 
                 case "DeleteProject":
                     if (parameters.ContainsKey("id"))
-                        DatabasePersistence.DeleteProject(uuid, parameters["id"].ToString());
+                    {
+                        var deleteProjId = parameters["id"].ToString();
+                        DatabasePersistence.DeleteProject(uuid, deleteProjId);
+                        AuditLogger.Log(uuid, connectionInfo.Username, "delete", "Projects", deleteProjId);
+                    }
                     break;
 
                 case "LoadVariables":
@@ -785,8 +922,16 @@ public class WebSocketManager
                     if (parameters.ContainsKey("model"))
                     {
                         var modelObj = JObject.FromObject(parameters["model"]);
-                        DatabasePersistence.SaveEntity(uuid, "DataModels", modelObj);
+                        var modelOwner = ResolveWriteOwner("DataModels", modelObj["id"]?.ToString(), uuid, connectionInfo.Roles);
+                        if (modelOwner == null)
+                        {
+                            response.Status = MessageStatus.Error;
+                            response.ErrorMessage = "You don't have permission to edit this data model.";
+                            break;
+                        }
+                        DatabasePersistence.SaveEntity(modelOwner, "DataModels", modelObj);
                         response.Data = modelObj;
+                        AuditLogger.Log(uuid, connectionInfo.Username, "save", "DataModels", modelObj["id"]?.ToString(), modelObj["name"]?.ToString());
                     }
                     break;
 
@@ -799,8 +944,119 @@ public class WebSocketManager
 
                 case "DeleteDataModel":
                     if (parameters.ContainsKey("id"))
-                        DatabasePersistence.DeleteEntity(uuid, "DataModels", parameters["id"].ToString());
+                    {
+                        var deleteModelId = parameters["id"].ToString();
+                        var deleteModelOwner = ResolveWriteOwner("DataModels", deleteModelId, uuid, connectionInfo.Roles);
+                        if (deleteModelOwner == null)
+                        {
+                            response.Status = MessageStatus.Error;
+                            response.ErrorMessage = "You don't have permission to delete this data model.";
+                            break;
+                        }
+                        DatabasePersistence.DeleteEntity(deleteModelOwner, "DataModels", deleteModelId);
+                        AuditLogger.Log(uuid, connectionInfo.Username, "delete", "DataModels", deleteModelId);
+                    }
                     break;
+
+                // ── Access control: per-user sharing + project membership ──────────
+                // ResourceType is always one of GrantableResourceTypes below, which double
+                // as real table names ('Projects' rows ARE the project; 'Dashboards' and
+                // 'SqlScripts' rows are the two kinds of content directly shareable today).
+                // Only the resource's owner or an admin can grant/revoke/list who has
+                // access -- an edit grant lets you change the resource's content, not decide
+                // who else gets to.
+                case "ShareResource":
+                {
+                    var resourceType = parameters.ContainsKey("resourceType") ? parameters["resourceType"]?.ToString() : null;
+                    var resourceId = parameters.ContainsKey("resourceId") ? parameters["resourceId"]?.ToString() : null;
+                    var granteeQuery = parameters.ContainsKey("grantee") ? parameters["grantee"]?.ToString()?.Trim() : null;
+                    var permission = parameters.ContainsKey("permission") ? parameters["permission"]?.ToString() : "view";
+
+                    if (!GrantableResourceTypes.Contains(resourceType) || string.IsNullOrEmpty(resourceId) || string.IsNullOrEmpty(granteeQuery))
+                    {
+                        response.Status = MessageStatus.Error;
+                        response.ErrorMessage = "Missing or invalid resourceType/resourceId/grantee";
+                        break;
+                    }
+                    if (!CanManageSharing(resourceType, resourceId, uuid, connectionInfo.Roles))
+                    {
+                        response.Status = MessageStatus.Error;
+                        response.ErrorMessage = "Only the owner or an admin can share this.";
+                        break;
+                    }
+
+                    var grantee = DatabasePersistence.FindUserByUsernameOrEmail(granteeQuery);
+                    var granteeId = grantee?["Id"]?.ToString() ?? grantee?["id"]?.ToString();
+                    if (string.IsNullOrEmpty(granteeId))
+                    {
+                        response.Status = MessageStatus.Error;
+                        response.ErrorMessage = $"No user found matching \"{granteeQuery}\".";
+                        break;
+                    }
+
+                    DatabasePersistence.SaveResourceGrant(resourceType, resourceId, granteeId, permission, uuid);
+                    AuditLogger.Log(uuid, connectionInfo.Username, "share", resourceType, resourceId, details: $"granted {permission} to {grantee["Username"] ?? grantee["username"]}");
+                    response.Data = new { success = true };
+                    break;
+                }
+
+                case "RevokeResourceGrant":
+                {
+                    var resourceType = parameters.ContainsKey("resourceType") ? parameters["resourceType"]?.ToString() : null;
+                    var resourceId = parameters.ContainsKey("resourceId") ? parameters["resourceId"]?.ToString() : null;
+                    var granteeUserId = parameters.ContainsKey("granteeUserId") ? parameters["granteeUserId"]?.ToString() : null;
+
+                    if (!GrantableResourceTypes.Contains(resourceType) || string.IsNullOrEmpty(resourceId) || string.IsNullOrEmpty(granteeUserId))
+                    {
+                        response.Status = MessageStatus.Error;
+                        response.ErrorMessage = "Missing or invalid resourceType/resourceId/granteeUserId";
+                        break;
+                    }
+                    if (!CanManageSharing(resourceType, resourceId, uuid, connectionInfo.Roles))
+                    {
+                        response.Status = MessageStatus.Error;
+                        response.ErrorMessage = "Only the owner or an admin can manage sharing for this.";
+                        break;
+                    }
+
+                    DatabasePersistence.RevokeResourceGrant(resourceType, resourceId, granteeUserId);
+                    AuditLogger.Log(uuid, connectionInfo.Username, "unshare", resourceType, resourceId);
+                    response.Data = new { success = true };
+                    break;
+                }
+
+                case "ListResourceGrants":
+                {
+                    var resourceType = parameters.ContainsKey("resourceType") ? parameters["resourceType"]?.ToString() : null;
+                    var resourceId = parameters.ContainsKey("resourceId") ? parameters["resourceId"]?.ToString() : null;
+
+                    if (!GrantableResourceTypes.Contains(resourceType) || string.IsNullOrEmpty(resourceId))
+                    {
+                        response.Status = MessageStatus.Error;
+                        response.ErrorMessage = "Missing or invalid resourceType/resourceId";
+                        break;
+                    }
+                    if (!CanManageSharing(resourceType, resourceId, uuid, connectionInfo.Roles))
+                    {
+                        response.Status = MessageStatus.Error;
+                        response.ErrorMessage = "Only the owner or an admin can view sharing for this.";
+                        break;
+                    }
+
+                    response.Data = DatabasePersistence.LoadResourceGrants(resourceType, resourceId);
+                    break;
+                }
+
+                // Admin-only, newest-first, optionally filtered by actor or resource type.
+                case "ListAuditLog":
+                {
+                    var limit = parameters.ContainsKey("limit") && int.TryParse(parameters["limit"]?.ToString(), out var l) ? Math.Clamp(l, 1, 500) : 100;
+                    var offset = parameters.ContainsKey("offset") && int.TryParse(parameters["offset"]?.ToString(), out var o) ? Math.Max(0, o) : 0;
+                    var filterUserId = parameters.ContainsKey("userId") ? parameters["userId"]?.ToString() : null;
+                    var filterResourceType = parameters.ContainsKey("resourceType") ? parameters["resourceType"]?.ToString() : null;
+                    response.Data = AuditLogger.List(limit, offset, filterUserId, filterResourceType);
+                    break;
+                }
 
                 // Introspects a saved DB connection's tables/columns so the Data Model
                 // editor can offer them for building relationships -- editors/admins only
@@ -1200,6 +1456,7 @@ public class WebSocketManager
         var authMsg = e.Message as AuthenticationMessage;
         string jwt = null;
         string displayName = null;
+        bool isFreshLogin = false; // true only for an actual username/password auth, not a token reconnect
 
         if (authMsg != null)
         {
@@ -1217,7 +1474,10 @@ public class WebSocketManager
                 jwt = _authService.AuthenticateAsync(new LoginRequest { Username = authMsg.Username, Password = authMsg.Password })
                     .GetAwaiter().GetResult();
                 if (!string.IsNullOrEmpty(jwt))
+                {
                     connectionInfo.UserId = _authService.GetUserIdFromToken(jwt);
+                    isFreshLogin = true;
+                }
             }
 
             if (!string.IsNullOrEmpty(connectionInfo.UserId))
@@ -1234,8 +1494,10 @@ public class WebSocketManager
                 else
                 {
                     connectionInfo.Roles = currentUser.Roles;
+                    connectionInfo.Username = currentUser.Username;
                     displayName = string.IsNullOrWhiteSpace(currentUser.FullName) ? currentUser.Username : currentUser.FullName;
                     RegisterUserDatabaseConnections(connectionInfo.UserId);
+                    if (isFreshLogin) AuditLogger.Log(connectionInfo.UserId, currentUser.Username, "login");
                 }
             }
         }

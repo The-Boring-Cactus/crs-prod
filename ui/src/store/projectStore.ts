@@ -1,6 +1,17 @@
 import { defineStore } from 'pinia';
 import { userStoreMe } from '@/store/userStore';
 
+function generateUUID(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -40,7 +51,7 @@ export const useProjectStore = defineStore('project', {
     },
     async saveProject(project: Partial<Project> & { id?: string }, socket: any) {
       const userStore = userStoreMe();
-      const payload = { ...project, id: project.id || crypto.randomUUID() };
+      const payload = { ...project, id: project.id || generateUUID() };
       await userStore.executeCommand('SaveProject', { project: payload }, socket);
       await this.loadProjects(socket);
       return payload;

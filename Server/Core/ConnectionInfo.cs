@@ -9,6 +9,7 @@ namespace Server.Core;
 public class ConnectionInfo
 {
     public string UserId { get; set; }
+    public string Username { get; set; }
     public string Roles { get; set; } = "user";
     public string ConnectionId { get; set; }
     public DateTime ConnectedAt { get; set; }

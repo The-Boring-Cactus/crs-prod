@@ -19,6 +19,8 @@ import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { Switch } from '@/components/ui/switch';
+import { Label } from '@/components/ui/label';
 import BaseChart from '@/components/BaseChart.vue';
 import BokehChart from '@/components/BokehChart.vue';
 import ExportMenu from '@/components/ExportMenu.vue';
@@ -28,7 +30,7 @@ import {
     Copy, Search, ChevronLeft, ChevronRight, Info, Trash2,
     Table2, LayoutList, TrendingUp, BarChart2, BarChart3, AreaChart, PieChart,
     ScatterChart, BarChart4, Settings2, Braces,
-    Donut, Disc3, Radar, Funnel, Gauge, Grid3x3
+    Donut, Disc3, Radar, Funnel, Gauge, Grid3x3, Clock, Send, UserPlus, X
 } from 'lucide-vue-next';
 import { useVariableStore } from '@/store/variableStore';
 
@@ -97,8 +99,29 @@ const vizConfig = reactive({
     pivotValueField: '',
     pivotAggregation: 'sum',
     engine: 'echarts', // 'echarts' | 'bokeh'
-    clickFilterVariable: '' // variable set by clicking a bar/slice in this chart (cross-filtering)
+    clickFilterVariable: '', // variable set by clicking a bar/slice in this chart (cross-filtering)
+    seriesColors: {} // { [valueColumn field]: '#rrggbb' } -- manual per-series color overrides
 });
+
+// Distinct default hues for chart series -- cycled by column index when a
+// value column has no explicit override in vizConfig.seriesColors.
+const DEFAULT_SERIES_PALETTE = ['#5470c6', '#91cc75', '#fac858', '#ee6666', '#73c0de', '#3ba272', '#9a60b4', '#ea7ccc'];
+
+// Effective color for a value column: its manual override if set, else the
+// next color in the default palette by position among the selected columns.
+const seriesColorFor = (field) => {
+    if (vizConfig.seriesColors[field]) return vizConfig.seriesColors[field];
+    const idx = Math.max(0, vizConfig.valueColumns.indexOf(field));
+    return DEFAULT_SERIES_PALETTE[idx % DEFAULT_SERIES_PALETTE.length];
+};
+
+const setSeriesColor = (field, color) => {
+    vizConfig.seriesColors[field] = color;
+};
+
+const resetSeriesColor = (field) => {
+    delete vizConfig.seriesColors[field];
+};
 
 // Select requires a non-empty value, so "no variable chosen" is represented
 // as the sentinel '__none__' in the UI and translated to '' in vizConfig.
@@ -172,6 +195,7 @@ const resetVizConfig = () => {
     vizConfig.pivotAggregation = 'sum';
     vizConfig.engine = 'echarts';
     vizConfig.clickFilterVariable = '';
+    vizConfig.seriesColors = {};
 };
 
 const applyVizFromScript = (script) => {
@@ -190,6 +214,7 @@ const applyVizFromScript = (script) => {
         vizConfig.pivotAggregation = viz.pivotAggregation || 'sum';
         vizConfig.engine = viz.engine || 'echarts';
         vizConfig.clickFilterVariable = viz.clickFilterVariable || '';
+        vizConfig.seriesColors = viz.seriesColors || {};
     } catch { vizType.value = 'table'; }
 };
 
@@ -237,10 +262,9 @@ const chartData = computed(() => {
 
     if (!labelCol && valueCols.length === 0) return null;
 
-    const palette = ['#5470c6', '#91cc75', '#fac858', '#ee6666', '#73c0de', '#3ba272'];
-
     if (vizType.value === 'pie') {
         const col = valueCols[0] || labelCol;
+        const palette = DEFAULT_SERIES_PALETTE;
         return {
             labels: rows.map(r => String(r[labelCol] ?? '')),
             datasets: [{
@@ -257,26 +281,30 @@ const chartData = computed(() => {
         const xCol = valueCols[0] || labelCol;
         const yCol = valueCols[1] || valueCols[0];
         if (!xCol || !yCol) return null;
+        const color = seriesColorFor(yCol);
         return {
             labels: [],
             datasets: [{
                 label: `${xCol} vs ${yCol}`,
                 data: rows.map(r => ({ x: Number(r[xCol]) || 0, y: Number(r[yCol]) || 0 })),
-                backgroundColor: palette[0] + 'aa',
-                borderColor: palette[0]
+                backgroundColor: color + 'aa',
+                borderColor: color
             }]
         };
     }
 
     const labels = rows.map(r => String(r[labelCol] ?? ''));
-    const datasets = valueCols.map((col, i) => ({
-        label: queryColumns.value.find(c => c.field === col)?.header || col,
-        data: rows.map(r => Number(r[col]) || 0),
-        backgroundColor: palette[i % palette.length] + 'bb',
-        borderColor: palette[i % palette.length],
-        borderWidth: 1,
-        fill: vizType.value === 'area'
-    }));
+    const datasets = valueCols.map((col, i) => {
+        const color = seriesColorFor(col);
+        return {
+            label: queryColumns.value.find(c => c.field === col)?.header || col,
+            data: rows.map(r => Number(r[col]) || 0),
+            backgroundColor: color + 'bb',
+            borderColor: color,
+            borderWidth: 1,
+            fill: vizType.value === 'area'
+        };
+    });
 
     return { labels, datasets };
 });
@@ -364,7 +392,8 @@ const currentScript = reactive({
     id: null,
     name: '',
     code: '',
-    database: null
+    database: null,
+    schedule: null // raw JSON string of the script's scheduled-delivery config, if any
 });
 
 const savedScripts = ref([]);
@@ -449,7 +478,10 @@ const getSelectedDatabaseName = () => databaseStore.connectionById(selectedDatab
 const getSelectedDatabaseType = () => databaseStore.connectionById(selectedDatabase.value)?.type || '';
 const getDatabaseIcon = () => Database;
 
-const executeQuery = async () => {
+// forceRefresh bypasses the server-side query cache (up to 15 minutes) so a user who just
+// changed the underlying data, or is testing for idempotency, can be sure they're seeing a
+// live result rather than a stale cached one -- see the "Force Refresh" toolbar button.
+const executeQuery = async (forceRefresh = false) => {
     if (!selectedDatabase.value || !code.value.trim()) return;
     isExecuting.value = true;
     hasExecuted.value = false;
@@ -461,7 +493,8 @@ const executeQuery = async () => {
         const substitutedCode = variableStore.substituteInSql(code.value, db?.type || '');
         const result = await userStore.executeCommand('ExecuteSql', {
             database: selectedDatabase.value,
-            code: substitutedCode
+            code: substitutedCode,
+            forceRefresh
         }, proxy.$socket);
 
         if (result && result.Data) {
@@ -487,6 +520,7 @@ const newScript = () => {
     currentScript.name = '';
     currentScript.code = '';
     currentScript.database = null;
+    currentScript.schedule = null;
     code.value = '';
     queryResults.value = [];
     queryColumns.value = [];
@@ -504,7 +538,8 @@ const buildVisualizationPayload = () => JSON.stringify({
     pivotValueField: vizConfig.pivotValueField,
     pivotAggregation: vizConfig.pivotAggregation,
     engine: vizConfig.engine,
-    clickFilterVariable: vizConfig.clickFilterVariable
+    clickFilterVariable: vizConfig.clickFilterVariable,
+    seriesColors: { ...vizConfig.seriesColors }
 });
 
 const saveScript = async () => {
@@ -535,6 +570,171 @@ const saveScript = async () => {
     }
 };
 
+// ── Scheduled delivery ──────────────────────────────────────────────────────
+// Emails this saved script's query results (HTML table + CSV) to a list of
+// recipients on a server-side schedule. Lives on the script row itself (one
+// schedule per saved query), so it's only available once the script has been
+// saved at least once (currentScript.id is set).
+const showScheduleDialog = ref(false);
+const savingSchedule = ref(false);
+const sendingTestNow = ref(false);
+const isScheduleEnabled = computed(() => {
+    try { return !!(currentScript.schedule && JSON.parse(currentScript.schedule).enabled); } catch { return false; }
+});
+const scheduleForm = reactive({
+    enabled: false,
+    frequency: 'daily', // 'hourly' | 'daily' | 'weekly'
+    intervalHours: 6,
+    time: '08:00', // HH:MM, interpreted as UTC -- shown as such in the dialog
+    daysOfWeek: [1, 2, 3, 4, 5], // 0=Sunday .. 6=Saturday
+    recipients: '', // comma-separated in the UI, split into an array on save
+    lastRunAt: null,
+    lastStatus: null,
+    lastError: null
+});
+
+const openScheduleDialog = () => {
+    if (!currentScript.id) return;
+    let parsed = null;
+    try { parsed = currentScript.schedule ? JSON.parse(currentScript.schedule) : null; } catch { parsed = null; }
+
+    scheduleForm.enabled = parsed?.enabled ?? false;
+    scheduleForm.frequency = parsed?.frequency ?? 'daily';
+    scheduleForm.intervalHours = parsed?.intervalHours ?? 6;
+    const hour = Number.isInteger(parsed?.hour) ? parsed.hour : 8;
+    const minute = Number.isInteger(parsed?.minute) ? parsed.minute : 0;
+    scheduleForm.time = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+    scheduleForm.daysOfWeek = parsed?.daysOfWeek ?? [1, 2, 3, 4, 5];
+    scheduleForm.recipients = (parsed?.recipients || []).join(', ');
+    scheduleForm.lastRunAt = parsed?.lastRunAt ?? null;
+    scheduleForm.lastStatus = parsed?.lastStatus ?? null;
+    scheduleForm.lastError = parsed?.lastError ?? null;
+
+    showScheduleDialog.value = true;
+};
+
+const toggleScheduleDay = (day) => {
+    const idx = scheduleForm.daysOfWeek.indexOf(day);
+    if (idx >= 0) scheduleForm.daysOfWeek.splice(idx, 1);
+    else scheduleForm.daysOfWeek.push(day);
+};
+
+const buildSchedulePayload = () => {
+    const [h, m] = scheduleForm.time.split(':').map(Number);
+    return {
+        enabled: scheduleForm.enabled,
+        frequency: scheduleForm.frequency,
+        intervalHours: Math.max(1, Number(scheduleForm.intervalHours) || 1),
+        hour: Number.isFinite(h) ? h : 8,
+        minute: Number.isFinite(m) ? m : 0,
+        daysOfWeek: [...scheduleForm.daysOfWeek],
+        recipients: scheduleForm.recipients.split(',').map(s => s.trim()).filter(Boolean),
+        lastRunAt: scheduleForm.lastRunAt,
+        lastStatus: scheduleForm.lastStatus,
+        lastError: scheduleForm.lastError
+    };
+};
+
+const saveSchedule = async () => {
+    if (!currentScript.id) return;
+    if (scheduleForm.enabled && buildSchedulePayload().recipients.length === 0) {
+        toast.error('No Recipients', { description: 'Add at least one recipient email before enabling delivery.' });
+        return;
+    }
+    savingSchedule.value = true;
+    try {
+        const payload = buildSchedulePayload();
+        await userStore.executeCommand('SaveScriptSchedule', { id: currentScript.id, schedule: payload }, proxy.$socket);
+        currentScript.schedule = JSON.stringify(payload);
+        const idx = savedScripts.value.findIndex(s => s.id === currentScript.id);
+        if (idx >= 0) savedScripts.value[idx].schedule = currentScript.schedule;
+        toast('Schedule Saved', { description: payload.enabled ? 'This report will now be delivered automatically.' : 'Scheduled delivery disabled.' });
+        showScheduleDialog.value = false;
+    } catch (error) {
+        toast.error('Save Failed', { description: error.message });
+    } finally {
+        savingSchedule.value = false;
+    }
+};
+
+const sendTestNow = async () => {
+    if (!currentScript.id) return;
+    const payload = buildSchedulePayload();
+    if (payload.recipients.length === 0) {
+        toast.error('No Recipients', { description: 'Add at least one recipient email to send a test.' });
+        return;
+    }
+    sendingTestNow.value = true;
+    try {
+        const result = await userStore.executeCommand('RunScriptScheduleNow', { id: currentScript.id, schedule: payload }, proxy.$socket);
+        toast('Test Sent', { description: result?.Data?.message || 'Report sent.' });
+    } catch (error) {
+        toast.error('Send Failed', { description: error.message });
+    } finally {
+        sendingTestNow.value = false;
+    }
+};
+
+// ── Sharing ──────────────────────────────────────────────────────────────
+// Grants a specific account view/edit access to this saved query, independent of
+// project membership. Only the script's owner (or an admin) can manage this --
+// enforced server-side by ShareResource/RevokeResourceGrant/ListResourceGrants.
+const showShareDialog = ref(false);
+const resourceGrants = ref([]);
+const loadingGrants = ref(false);
+const grantQuery = ref('');
+const grantPermission = ref('view');
+const addingGrant = ref(false);
+
+const openShareDialog = () => {
+    if (!currentScript.id) return;
+    showShareDialog.value = true;
+    loadResourceGrants();
+};
+
+const loadResourceGrants = async () => {
+    if (!currentScript.id) return;
+    loadingGrants.value = true;
+    try {
+        const result = await userStore.executeCommand('ListResourceGrants',
+            { resourceType: 'SqlScripts', resourceId: currentScript.id }, proxy.$socket);
+        resourceGrants.value = result?.Data || [];
+    } catch {
+        resourceGrants.value = [];
+    } finally {
+        loadingGrants.value = false;
+    }
+};
+
+const addResourceGrant = async () => {
+    if (!grantQuery.value.trim() || !currentScript.id) return;
+    addingGrant.value = true;
+    try {
+        await userStore.executeCommand('ShareResource', {
+            resourceType: 'SqlScripts', resourceId: currentScript.id,
+            grantee: grantQuery.value.trim(), permission: grantPermission.value
+        }, proxy.$socket);
+        grantQuery.value = '';
+        await loadResourceGrants();
+        toast('Access Granted');
+    } catch (error) {
+        toast.error('Failed to Share', { description: error.message });
+    } finally {
+        addingGrant.value = false;
+    }
+};
+
+const revokeResourceGrant = async (granteeUserId) => {
+    try {
+        await userStore.executeCommand('RevokeResourceGrant',
+            { resourceType: 'SqlScripts', resourceId: currentScript.id, granteeUserId }, proxy.$socket);
+        await loadResourceGrants();
+        toast('Access Revoked');
+    } catch (error) {
+        toast.error('Failed to Revoke', { description: error.message });
+    }
+};
+
 const loadScript = () => {
     loadScriptsFromStorage();
     showLoadDialog.value = true;
@@ -547,6 +747,7 @@ const confirmLoadScript = () => {
     currentScript.name = script.name;
     currentScript.code = script.code;
     currentScript.database = script.database;
+    currentScript.schedule = script.schedule || null;
     code.value = script.code || '';
     selectedDatabase.value = script.database || null;
     queryResults.value = [];
@@ -586,6 +787,7 @@ const loadScriptsFromStorage = async () => {
                 databaseName: s.databaseName || s.DatabaseName || '',
                 language: s.language || s.Language || 'sql',
                 visualization: s.visualization || s.Visualization || null,
+                schedule: s.schedule || s.Schedule || null,
                 createdAt: new Date(s.createdAt || s.CreatedAt || s.createdat || Date.now()),
                 updatedAt: new Date(s.updatedAt || s.UpdatedAt || s.updatedat || s.createdAt || s.CreatedAt || s.createdat || Date.now()),
             }));
@@ -676,10 +878,14 @@ watch(() => projectStore.currentProjectId, () => {
             </div>
 
             <div class="flex items-center gap-2">
-                <Button @click="executeQuery" :disabled="!selectedDatabase || !code.trim() || isExecuting" class="bg-green-600 hover:bg-green-700 text-white gap-2">
+                <Button @click="executeQuery(false)" :disabled="!selectedDatabase || !code.trim() || isExecuting" class="bg-green-600 hover:bg-green-700 text-white gap-2">
                     <Loader2 v-if="isExecuting" class="w-4 h-4 animate-spin" />
                     <Play v-else class="w-4 h-4" />
                     Execute
+                </Button>
+                <Button variant="outline" size="icon" @click="executeQuery(true)" :disabled="!selectedDatabase || !code.trim() || isExecuting"
+                        title="Force Refresh: re-run against the database now, skipping the cached result (results may otherwise be cached up to 15 minutes)">
+                    <RefreshCw class="w-4 h-4" />
                 </Button>
                 <Button variant="secondary" @click="saveScript" :disabled="!code.trim()" class="gap-2">
                     <Save class="w-4 h-4" />
@@ -707,6 +913,16 @@ watch(() => projectStore.currentProjectId, () => {
             <div class="flex items-center gap-1">
                 <Button variant="ghost" size="icon" @click="loadScript" title="Open Script"><FolderOpen class="w-4 h-4" /></Button>
                 <Button variant="ghost" size="icon" @click="newScript" title="New Script"><Plus class="w-4 h-4" /></Button>
+                <div class="w-px h-6 bg-border mx-2"></div>
+                <Button variant="ghost" size="icon" class="relative" @click="openScheduleDialog" :disabled="!currentScript.id"
+                        :title="currentScript.id ? 'Schedule Delivery' : 'Save the script first to schedule delivery'">
+                    <Clock class="w-4 h-4" />
+                    <span v-if="isScheduleEnabled" class="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-green-500"></span>
+                </Button>
+                <Button variant="ghost" size="icon" @click="openShareDialog" :disabled="!currentScript.id"
+                        :title="currentScript.id ? 'Share' : 'Save the script first to share it'">
+                    <UserPlus class="w-4 h-4" />
+                </Button>
                 <div class="w-px h-6 bg-border mx-2"></div>
                 <Button variant="ghost" size="icon" @click="handleUndo" title="Undo"><Undo class="w-4 h-4" /></Button>
                 <Button variant="ghost" size="icon" @click="handleRedo" title="Redo"><RefreshCw class="w-4 h-4" /></Button>
@@ -853,17 +1069,27 @@ watch(() => projectStore.currentProjectId, () => {
 
                 <div class="flex items-center gap-2 flex-wrap">
                     <span class="text-xs font-medium text-muted-foreground">Values:</span>
-                    <button
-                        v-for="col in queryColumns.filter(c => c.field !== vizConfig.labelColumn)" :key="col.field"
-                        @click="toggleValueColumn(col.field)"
-                        :class="[
-                            'px-2 py-0.5 rounded-sm text-xs border cursor-pointer transition-colors',
-                            vizConfig.valueColumns.includes(col.field)
-                                ? 'bg-primary text-primary-foreground border-primary'
-                                : 'bg-background border-border text-foreground hover:bg-muted'
-                        ]">
-                        {{ col.header }}
-                    </button>
+                    <div v-for="col in queryColumns.filter(c => c.field !== vizConfig.labelColumn)" :key="col.field"
+                         class="inline-flex items-center gap-1">
+                        <button
+                            @click="toggleValueColumn(col.field)"
+                            :class="[
+                                'px-2 py-0.5 rounded-sm text-xs border cursor-pointer transition-colors',
+                                vizConfig.valueColumns.includes(col.field)
+                                    ? 'bg-primary text-primary-foreground border-primary'
+                                    : 'bg-background border-border text-foreground hover:bg-muted'
+                            ]">
+                            {{ col.header }}
+                        </button>
+                        <input
+                            v-if="vizConfig.valueColumns.includes(col.field) && !['pie', 'doughnut', 'polarArea'].includes(vizType)"
+                            type="color"
+                            class="w-5 h-5 p-0 border rounded cursor-pointer bg-transparent"
+                            :value="seriesColorFor(col.field)"
+                            @input="setSeriesColor(col.field, $event.target.value)"
+                            @dblclick="resetSeriesColor(col.field)"
+                            :title="`Series color for ${col.header} (double-click to reset)`" />
+                    </div>
                 </div>
 
                 <div v-if="isBokehSupportedVizType" class="flex items-center gap-2">
@@ -1115,6 +1341,121 @@ watch(() => projectStore.currentProjectId, () => {
                 <DialogFooter>
                     <Button variant="outline" @click="showLoadDialog = false">Cancel</Button>
                     <Button @click="confirmLoadScript" :disabled="!selectedScriptToLoad">Load Script</Button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
+
+        <!-- Schedule Delivery Dialog -->
+        <Dialog :open="showScheduleDialog" @update:open="showScheduleDialog = $event">
+            <DialogContent class="sm:max-w-[520px]">
+                <DialogHeader>
+                    <DialogTitle>Schedule Delivery</DialogTitle>
+                    <DialogDescription>Run "{{ currentScript.name || 'this script' }}" on a schedule and email the results.</DialogDescription>
+                </DialogHeader>
+                <div class="py-2 space-y-4">
+                    <div class="flex items-center justify-between">
+                        <Label for="schedule-enabled">Enable scheduled delivery</Label>
+                        <Switch id="schedule-enabled" :checked="scheduleForm.enabled" @update:checked="(val) => (scheduleForm.enabled = val)" />
+                    </div>
+
+                    <div class="space-y-1.5">
+                        <Label for="schedule-recipients">Recipients (comma-separated emails)</Label>
+                        <Input id="schedule-recipients" v-model="scheduleForm.recipients" placeholder="alice@example.com, bob@example.com" />
+                    </div>
+
+                    <div class="flex items-center gap-3">
+                        <div class="space-y-1.5 flex-1">
+                            <Label>Frequency</Label>
+                            <Select v-model="scheduleForm.frequency">
+                                <SelectTrigger class="h-9"><SelectValue /></SelectTrigger>
+                                <SelectContent>
+                                    <SelectItem value="hourly">Every N hours</SelectItem>
+                                    <SelectItem value="daily">Daily</SelectItem>
+                                    <SelectItem value="weekly">Weekly</SelectItem>
+                                </SelectContent>
+                            </Select>
+                        </div>
+
+                        <div v-if="scheduleForm.frequency === 'hourly'" class="space-y-1.5 w-[110px]">
+                            <Label for="schedule-interval">Every (hrs)</Label>
+                            <Input id="schedule-interval" type="number" min="1" max="24" v-model="scheduleForm.intervalHours" />
+                        </div>
+                        <div v-else class="space-y-1.5 w-[130px]">
+                            <Label for="schedule-time">Time (UTC)</Label>
+                            <Input id="schedule-time" type="time" v-model="scheduleForm.time" />
+                        </div>
+                    </div>
+
+                    <div v-if="scheduleForm.frequency === 'weekly'" class="space-y-1.5">
+                        <Label>Days of week</Label>
+                        <div class="flex gap-1">
+                            <button v-for="(label, day) in ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']" :key="day"
+                                    type="button" @click="toggleScheduleDay(day)"
+                                    :class="[
+                                        'w-9 h-8 rounded text-xs border transition-colors',
+                                        scheduleForm.daysOfWeek.includes(day)
+                                            ? 'bg-primary text-primary-foreground border-primary'
+                                            : 'bg-background border-border text-foreground hover:bg-muted'
+                                    ]">
+                                {{ label }}
+                            </button>
+                        </div>
+                    </div>
+
+                    <div v-if="scheduleForm.lastRunAt" class="text-xs text-muted-foreground border rounded-md px-3 py-2 bg-muted/40">
+                        Last run: {{ formatDate(scheduleForm.lastRunAt) }} —
+                        <span :class="scheduleForm.lastStatus === 'error' ? 'text-destructive' : 'text-green-600'">{{ scheduleForm.lastStatus === 'error' ? 'Failed' : 'Success' }}</span>
+                        <div v-if="scheduleForm.lastError" class="text-destructive mt-1">{{ scheduleForm.lastError }}</div>
+                    </div>
+                </div>
+                <DialogFooter class="flex items-center sm:justify-between">
+                    <Button variant="outline" @click="sendTestNow" :disabled="sendingTestNow" class="gap-2">
+                        <Loader2 v-if="sendingTestNow" class="w-4 h-4 animate-spin" />
+                        <Send v-else class="w-4 h-4" />
+                        Send Test Now
+                    </Button>
+                    <div class="flex gap-2">
+                        <Button variant="outline" @click="showScheduleDialog = false">Cancel</Button>
+                        <Button @click="saveSchedule" :disabled="savingSchedule">{{ savingSchedule ? 'Saving...' : 'Save Schedule' }}</Button>
+                    </div>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
+
+        <!-- Share Dialog -->
+        <Dialog :open="showShareDialog" @update:open="showShareDialog = $event">
+            <DialogContent class="sm:max-w-[440px]">
+                <DialogHeader>
+                    <DialogTitle>Share "{{ currentScript.name || 'this script' }}"</DialogTitle>
+                    <DialogDescription>Grant specific people view or edit access to this saved query.</DialogDescription>
+                </DialogHeader>
+                <div class="py-2 space-y-2">
+                    <div class="flex gap-2">
+                        <Input v-model="grantQuery" placeholder="Username or email" @keyup.enter="addResourceGrant" class="text-sm" />
+                        <select v-model="grantPermission" class="h-9 rounded-md border border-input bg-transparent px-2 text-sm">
+                            <option value="view">Can view</option>
+                            <option value="edit">Can edit</option>
+                        </select>
+                        <Button variant="outline" size="icon" @click="addResourceGrant" :disabled="!grantQuery.trim() || addingGrant" title="Add">
+                            <Loader2 v-if="addingGrant" class="w-4 h-4 animate-spin" /><UserPlus v-else class="w-4 h-4" />
+                        </Button>
+                    </div>
+                    <div v-if="resourceGrants.length" class="space-y-1 pt-1">
+                        <div v-for="grant in resourceGrants" :key="grant.granteeUserId || grant.GranteeUserId"
+                             class="flex items-center justify-between text-xs bg-muted/40 rounded px-2 py-1.5">
+                            <div class="min-w-0">
+                                <span class="font-medium">{{ grant.fullName || grant.FullName || grant.username || grant.Username }}</span>
+                                <span class="text-muted-foreground ml-1">({{ grant.permission || grant.Permission }})</span>
+                            </div>
+                            <button class="text-muted-foreground hover:text-destructive shrink-0" @click="revokeResourceGrant(grant.granteeUserId || grant.GranteeUserId)" title="Revoke access">
+                                <X class="w-3.5 h-3.5" />
+                            </button>
+                        </div>
+                    </div>
+                    <p v-else-if="!loadingGrants" class="text-xs text-muted-foreground py-2">Not shared with anyone yet.</p>
+                </div>
+                <DialogFooter>
+                    <Button variant="outline" @click="showShareDialog = false" class="w-full">Done</Button>
                 </DialogFooter>
             </DialogContent>
         </Dialog>

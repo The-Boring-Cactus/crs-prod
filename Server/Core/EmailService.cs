@@ -1,7 +1,6 @@
 using MailKit.Net.Smtp;
 using MailKit.Security;
 using MimeKit;
-using MimeKit.Text;
 
 namespace Server.Core;
 
@@ -17,7 +16,14 @@ public static class EmailService
         && !string.IsNullOrWhiteSpace(smtp.Host)
         && !string.IsNullOrWhiteSpace(smtp.FromAddress);
 
-    public static async Task<(bool success, string message)> SendEmailAsync(string toAddress, string subject, string htmlBody)
+    public static Task<(bool success, string message)> SendEmailAsync(string toAddress, string subject, string htmlBody)
+        => SendEmailAsync(toAddress, subject, htmlBody, null);
+
+    // attachments: optional files (e.g. a scheduled report's CSV export) to include
+    // alongside the HTML body -- used by ReportScheduleWorker.
+    public static async Task<(bool success, string message)> SendEmailAsync(
+        string toAddress, string subject, string htmlBody,
+        IEnumerable<(string FileName, byte[] Content, string ContentType)> attachments)
     {
         var config = SetupConfig.Load();
         var smtp = config.Smtp;
@@ -34,7 +40,12 @@ public static class EmailService
             message.From.Add(MailboxAddress.Parse(smtp.FromAddress));
             message.To.Add(MailboxAddress.Parse(toAddress));
             message.Subject = subject;
-            message.Body = new TextPart(TextFormat.Html) { Text = htmlBody };
+
+            var builder = new BodyBuilder { HtmlBody = htmlBody };
+            if (attachments != null)
+                foreach (var a in attachments)
+                    builder.Attachments.Add(a.FileName, a.Content, MimeKit.ContentType.Parse(a.ContentType));
+            message.Body = builder.ToMessageBody();
 
             using var client = new SmtpClient();
             var port = smtp.Port > 0 ? smtp.Port : 587;

@@ -29,11 +29,15 @@ namespace FunctEngine
             return null;
         }
 
-        // Chart(chartType, labels, values, title?)
+        // Chart(chartType, labels, values, title?, colors?)
         // chartType: "bar", "line", "pie", "doughnut", "area", "radar", "scatter"
         // labels: array of category labels
         // values: single array (single series) or array of arrays (multi-series)
         // title: optional string
+        // colors: optional array of hex color strings ("#rrggbb"), one per series
+        //         (multi-series) or one per category (single-series pie-style charts).
+        //         Cycles if there are fewer colors than series/categories. Omit to use
+        //         the frontend's default palette.
         public object EmitChart(object[] args)
         {
             if (args.Length < 3) return null;
@@ -41,6 +45,9 @@ namespace FunctEngine
             var chartType = args[0]?.ToString() ?? "bar";
             var labels = ExtractList(args[1]);
             var title = args.Length > 3 ? args[3]?.ToString() ?? "" : "";
+            var colors = args.Length > 4 && args[4] != null
+                ? ExtractList(args[4]).Select(c => c?.ToString()).Where(c => !string.IsNullOrEmpty(c)).ToList()
+                : null;
 
             object datasetsPayload;
 
@@ -50,15 +57,20 @@ namespace FunctEngine
                 var datasets = outerList.Select((ds, i) => (object)new
                 {
                     label = $"Series {i + 1}",
-                    data = ExtractList(ds)
+                    data = ExtractList(ds),
+                    backgroundColor = colors != null && colors.Count > 0 ? colors[i % colors.Count] : null
                 }).ToList();
                 datasetsPayload = datasets;
             }
             else
             {
+                object seriesColor = null;
+                if (colors != null && colors.Count > 0)
+                    seriesColor = colors.Count > 1 ? (object)colors : colors[0];
+
                 datasetsPayload = new List<object>
                 {
-                    new { label = title.Length > 0 ? title : "Values", data = ExtractList(args[2]) }
+                    new { label = title.Length > 0 ? title : "Values", data = ExtractList(args[2]), backgroundColor = seriesColor }
                 };
             }
 

@@ -54,6 +54,136 @@ public static class DatabasePersistence
     internal static bool IsOracleConnection(DbConnection conn)
         => conn?.GetType().FullName?.StartsWith("Oracle.") == true;
 
+    // Converts a string entity id to the database's expected parameter type: MySQL/Oracle
+    // store ids as plain strings, everything else uses native Guid columns. Internal (not
+    // private) so AuditLogger can reuse it for its own inserts.
+    internal static object ToDbId(DbConnection conn, string id) =>
+        (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? id : Guid.Parse(id);
+
+    internal static object ToDbIdOrNull(DbConnection conn, string id) =>
+        string.IsNullOrEmpty(id) ? null : ToDbId(conn, id);
+
+    // ── Access control (ResourceGrants) ──────────────────────────────────
+    // A grant is a (ResourceType, ResourceId, GranteeUserId) row giving a specific user
+    // "view" or "edit" access to something they don't own. ResourceType is always one of
+    // this app's table names ('Projects', 'Dashboards', 'SqlScripts', ...) -- a compile-time
+    // constant supplied by calling code, never user input, so it's safe to interpolate
+    // directly into SQL below.
+    //
+    // Project membership (ResourceType = 'Projects') cascades: being granted access to a
+    // project also grants access to everything inside it (its dashboards, scripts, data
+    // models, and non-global database connections), via the second half of
+    // GrantVisibilityClause. Direct per-resource grants exist independently of project
+    // membership, for sharing a single dashboard/script with someone outside the project.
+    private const string ProjectResourceType = "Projects";
+
+    private static string ProjectVisibilityClause(string projectIdColumn = "ProjectId") => $@"
+        OR ({projectIdColumn} IS NOT NULL AND {projectIdColumn} IN (SELECT ResourceId FROM ResourceGrants WHERE ResourceType = '{ProjectResourceType}' AND GranteeUserId = @UserId))";
+
+    private static string GrantVisibilityClause(string resourceType, string idColumn = "Id", string projectIdColumn = "ProjectId") => $@"
+        OR {idColumn} IN (SELECT ResourceId FROM ResourceGrants WHERE ResourceType = '{resourceType}' AND GranteeUserId = @UserId)
+        {ProjectVisibilityClause(projectIdColumn)}";
+
+    public static void SaveResourceGrant(string resourceType, string resourceId, string granteeUserId, string permission, string grantedByUserId)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return;
+
+        conn.Open();
+        object dbResourceId = ToDbId(conn, resourceId);
+        object dbGranteeId = ToDbId(conn, granteeUserId);
+        object dbGrantedBy = ToDbId(conn, grantedByUserId);
+
+        // Upsert via delete+insert, matching this file's convention elsewhere (e.g. SaveScript).
+        conn.Execute("DELETE FROM ResourceGrants WHERE ResourceType = @ResourceType AND ResourceId = @ResourceId AND GranteeUserId = @GranteeUserId",
+            new { ResourceType = resourceType, ResourceId = dbResourceId, GranteeUserId = dbGranteeId });
+        conn.Execute(@"INSERT INTO ResourceGrants (Id, ResourceType, ResourceId, GranteeUserId, Permission, GrantedBy)
+                        VALUES (@Id, @ResourceType, @ResourceId, @GranteeUserId, @Permission, @GrantedBy)",
+            new
+            {
+                Id = ToDbId(conn, Guid.NewGuid().ToString()),
+                ResourceType = resourceType,
+                ResourceId = dbResourceId,
+                GranteeUserId = dbGranteeId,
+                Permission = permission == "edit" ? "edit" : "view",
+                GrantedBy = dbGrantedBy
+            });
+    }
+
+    public static void RevokeResourceGrant(string resourceType, string resourceId, string granteeUserId)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return;
+
+        conn.Open();
+        conn.Execute("DELETE FROM ResourceGrants WHERE ResourceType = @ResourceType AND ResourceId = @ResourceId AND GranteeUserId = @GranteeUserId",
+            new { ResourceType = resourceType, ResourceId = ToDbId(conn, resourceId), GranteeUserId = ToDbId(conn, granteeUserId) });
+    }
+
+    // Grants on one resource, joined with Users so the Share dialog can show a name instead
+    // of a raw id.
+    public static List<JObject> LoadResourceGrants(string resourceType, string resourceId)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return new List<JObject>();
+
+        conn.Open();
+        var rows = conn.Query(@"SELECT g.GranteeUserId, g.Permission, g.CreatedAt, u.Username, u.FullName, u.Email
+                                 FROM ResourceGrants g JOIN Users u ON u.Id = g.GranteeUserId
+                                 WHERE g.ResourceType = @ResourceType AND g.ResourceId = @ResourceId",
+            new { ResourceType = resourceType, ResourceId = ToDbId(conn, resourceId) });
+        return rows.Select(r => JObject.Parse(JsonConvert.SerializeObject(r))).Cast<JObject>().ToList();
+    }
+
+    // Owning UserId (and, if the table has one, ProjectId) for a single row -- used to check
+    // edit permission on a Save/Delete call before falling back to ResourceGrants.
+    public static (string ownerUserId, string projectId) GetResourceOwner(string tableName, string id)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return (null, null);
+
+        conn.Open();
+        var row = conn.QueryFirstOrDefault($"SELECT * FROM {tableName} WHERE Id = @Id", new { Id = ToDbId(conn, id) });
+        if (row == null) return (null, null);
+
+        var obj = JObject.Parse(JsonConvert.SerializeObject(row));
+        var ownerId = obj["userid"]?.ToString() ?? obj["userId"]?.ToString() ?? obj["UserId"]?.ToString();
+        var projId = obj["projectid"]?.ToString() ?? obj["projectId"]?.ToString() ?? obj["ProjectId"]?.ToString();
+        return (ownerId, string.IsNullOrEmpty(projId) ? null : projId);
+    }
+
+    // True if userId may edit a row it doesn't own: an admin, a direct 'edit' grant on the
+    // resource itself, or an 'edit' grant on the project it belongs to.
+    public static bool HasEditGrant(string userId, string resourceType, string resourceId, string projectId)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return false;
+
+        conn.Open();
+        var dbUserId = ToDbId(conn, userId);
+        var count = conn.QueryFirstOrDefault<int>($@"
+            SELECT COUNT(*) FROM ResourceGrants
+            WHERE Permission = 'edit' AND GranteeUserId = @UserId
+              AND ((ResourceType = @ResourceType AND ResourceId = @ResourceId)
+                   {(string.IsNullOrEmpty(projectId) ? "" : $"OR (ResourceType = '{ProjectResourceType}' AND ResourceId = @ProjectId)")})",
+            new { UserId = dbUserId, ResourceType = resourceType, ResourceId = ToDbId(conn, resourceId), ProjectId = string.IsNullOrEmpty(projectId) ? null : ToDbId(conn, projectId) });
+        return count > 0;
+    }
+
+    // Resolves who to grant access to from what the Share dialog's "add a person" field
+    // holds -- a username or an email, either exact. Returns null if nobody matches.
+    public static JObject FindUserByUsernameOrEmail(string usernameOrEmail)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return null;
+
+        conn.Open();
+        var row = conn.QueryFirstOrDefault(
+            "SELECT Id, Username, FullName, Email FROM Users WHERE Username = @Q OR Email = @Q",
+            new { Q = usernameOrEmail });
+        return row == null ? null : JObject.Parse(JsonConvert.SerializeObject(row));
+    }
+
     // ── Generic JSON entity operations ──────────────────────────────────
     // Each "entity table" stores rows as JSON blobs in a dedicated table,
     // keyed by (UserId, Id).  The tables were created during setup.
@@ -67,18 +197,29 @@ public static class DatabasePersistence
 
         conn.Open();
         string tableName = language == "csharp" ? "CodeScripts" : "SqlScripts";
-        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+        object dbUserId = ToDbId(conn, userId);
 
+        // Direct per-resource sharing only exists for SqlScripts today (SqlEditor's Share
+        // button); CodeScripts visibility is still ownership + project-membership only.
+        var grantClause = tableName == "SqlScripts" ? GrantVisibilityClause(tableName) : ProjectVisibilityClause();
+
+        // Bind @ProjectId only when a filter is actually requested: passing a typeless
+        // null (DBNull.Value boxed as object) leaves Npgsql unable to infer the parameter's
+        // data type ("42P08: could not determine data type of parameter"), so the query
+        // must simply omit the parameter/clause instead of relying on "@ProjectId IS NULL".
         IEnumerable<dynamic> rows;
-        if (!string.IsNullOrEmpty(projectId))
+        if (string.IsNullOrEmpty(projectId))
         {
-            object dbProjId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? projectId : Guid.Parse(projectId);
-            rows = conn.Query($"SELECT * FROM {tableName} WHERE UserId = @UserId AND ProjectId = @ProjectId",
-                new { UserId = dbUserId, ProjectId = dbProjId });
+            rows = conn.Query($@"SELECT * FROM {tableName} WHERE (UserId = @UserId {grantClause})",
+                new { UserId = dbUserId });
         }
         else
         {
-            rows = conn.Query($"SELECT * FROM {tableName} WHERE UserId = @UserId", new { UserId = dbUserId });
+            object dbProjId = ToDbId(conn, projectId);
+            rows = conn.Query($@"SELECT * FROM {tableName}
+                WHERE (UserId = @UserId {grantClause})
+                  AND ProjectId = @ProjectId",
+                new { UserId = dbUserId, ProjectId = dbProjId });
         }
         return rows.Select(r => JObject.Parse(JsonConvert.SerializeObject(r))).Cast<JObject>().ToList();
     }
@@ -117,12 +258,51 @@ public static class DatabasePersistence
         else
         {
             var visualizationStr = scriptObj["visualization"]?.ToString() ?? scriptObj["Visualization"]?.ToString();
+
+            // A plain code/query save from SqlEditor never carries a "schedule" key --
+            // it only ever gets set via UpdateScriptSchedule. Since this method deletes
+            // and reinserts the row, look up the current value first so an ordinary save
+            // doesn't silently wipe out a configured schedule.
+            var scheduleStr = scriptObj.ContainsKey("schedule") || scriptObj.ContainsKey("Schedule")
+                ? (scriptObj["schedule"]?.ToString() ?? scriptObj["Schedule"]?.ToString())
+                : conn.QueryFirstOrDefault<string>("SELECT Schedule FROM SqlScripts WHERE Id = @Id AND UserId = @UserId",
+                    new { Id = dbId, UserId = dbUserId });
+
             conn.Execute(@"DELETE FROM SqlScripts WHERE Id = @Id AND UserId = @UserId",
                 new { Id = dbId, UserId = dbUserId });
-            conn.Execute(@"INSERT INTO SqlScripts (Id, UserId, Name, Language, Code, DatabaseConnectionId, ProjectId, Visualization)
-                          VALUES (@Id, @UserId, @Name, @Language, @Code, @DatabaseConnectionId, @ProjectId, @Visualization)",
-                new { Id = dbId, UserId = dbUserId, Name = name, Language = language, Code = code, DatabaseConnectionId = dbConnId, ProjectId = dbProjId, Visualization = visualizationStr });
+            conn.Execute(@"INSERT INTO SqlScripts (Id, UserId, Name, Language, Code, DatabaseConnectionId, ProjectId, Visualization, Schedule)
+                          VALUES (@Id, @UserId, @Name, @Language, @Code, @DatabaseConnectionId, @ProjectId, @Visualization, @Schedule)",
+                new { Id = dbId, UserId = dbUserId, Name = name, Language = language, Code = code, DatabaseConnectionId = dbConnId, ProjectId = dbProjId, Visualization = visualizationStr, Schedule = scheduleStr });
         }
+    }
+
+    // Updates only the Schedule column, independent of SaveScript's full delete+reinsert --
+    // used by the "Schedule Delivery" dialog so toggling/editing a schedule never touches
+    // (or risks clobbering) the script's own code/visualization in the same round trip.
+    public static void UpdateScriptSchedule(string userId, string id, string scheduleJson)
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return;
+
+        conn.Open();
+        object dbId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? id : Guid.Parse(id);
+        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+
+        conn.Execute("UPDATE SqlScripts SET Schedule = @Schedule WHERE Id = @Id AND UserId = @UserId",
+            new { Schedule = scheduleJson, Id = dbId, UserId = dbUserId });
+    }
+
+    // Cross-user scan for the background delivery worker, which has to find every script
+    // with an active schedule regardless of who owns it (mirrors LoadAllEntities's role
+    // for ScheduledRefreshService).
+    public static List<JObject> LoadAllScheduledSqlScripts()
+    {
+        using var conn = CreateConnection();
+        if (conn == null) return new List<JObject>();
+
+        conn.Open();
+        var rows = conn.Query("SELECT * FROM SqlScripts WHERE Schedule IS NOT NULL");
+        return rows.Select(r => JObject.Parse(JsonConvert.SerializeObject(r))).Cast<JObject>().ToList();
     }
 
     public static void DeleteScript(string userId, string id, string language)
@@ -133,7 +313,7 @@ public static class DatabasePersistence
         conn.Open();
         object dbId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? id : Guid.Parse(id);
         object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
-        
+
         string tableName = language == "csharp" ? "CodeScripts" : "SqlScripts";
         conn.Execute($"DELETE FROM {tableName} WHERE Id = @Id AND UserId = @UserId",
             new { Id = dbId, UserId = dbUserId });
@@ -147,18 +327,22 @@ public static class DatabasePersistence
         if (conn == null) return new List<JObject>();
 
         conn.Open();
-        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+        object dbUserId = ToDbId(conn, userId);
+        // Project members see the project's connections too, alongside their own and any
+        // marked IsGlobal -- there's no direct per-connection sharing (only project-wide).
+        var projectClause = ProjectVisibilityClause();
 
         IEnumerable<dynamic> rows;
         if (!string.IsNullOrEmpty(projectId))
         {
-            object dbProjId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? projectId : Guid.Parse(projectId);
-            rows = conn.Query("SELECT * FROM DatabaseConnections WHERE (UserId = @UserId AND ProjectId = @ProjectId) OR (UserId = @UserId AND ProjectId IS NULL) OR IsGlobal = @True",
+            object dbProjId = ToDbId(conn, projectId);
+            rows = conn.Query($@"SELECT * FROM DatabaseConnections
+                WHERE (UserId = @UserId AND ProjectId = @ProjectId) OR (UserId = @UserId AND ProjectId IS NULL) OR IsGlobal = @True {projectClause}",
                 new { UserId = dbUserId, ProjectId = dbProjId, True = true });
         }
         else
         {
-            rows = conn.Query("SELECT * FROM DatabaseConnections WHERE UserId = @UserId OR IsGlobal = @True",
+            rows = conn.Query($@"SELECT * FROM DatabaseConnections WHERE UserId = @UserId OR IsGlobal = @True {projectClause}",
                 new { UserId = dbUserId, True = true });
         }
         return rows.Select(r => JObject.Parse(JsonConvert.SerializeObject(r))).Cast<JObject>().ToList();
@@ -225,24 +409,38 @@ public static class DatabasePersistence
 
     private static readonly HashSet<string> ShareableTables = new() { "Dashboards", "Reports" };
 
+    // Tables where a single row can be shared directly with a specific user (via the Share
+    // dialog), independent of project membership. Everything else in this generic-entity
+    // family (Datasets, DataModels) is still visible to project members, just not shareable
+    // one row at a time.
+    private static readonly HashSet<string> GrantableTables = new() { "Dashboards" };
+
     public static List<JObject> LoadEntities(string userId, string tableName, string projectId = null)
     {
         using var conn = CreateConnection();
         if (conn == null) return new List<JObject>();
 
         conn.Open();
-        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
+        object dbUserId = ToDbId(conn, userId);
+        var grantClause = GrantableTables.Contains(tableName) ? GrantVisibilityClause(tableName) : ProjectVisibilityClause();
 
+        // Bind @ProjectId only when a filter is actually requested: passing a typeless
+        // null (DBNull.Value boxed as object) leaves Npgsql unable to infer the parameter's
+        // data type ("42P08: could not determine data type of parameter"), so the query
+        // must simply omit the parameter/clause instead of relying on "@ProjectId IS NULL".
         IEnumerable<dynamic> rows;
-        if (!string.IsNullOrEmpty(projectId))
+        if (string.IsNullOrEmpty(projectId))
         {
-            object dbProjId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? projectId : Guid.Parse(projectId);
-            rows = conn.Query($"SELECT * FROM {tableName} WHERE UserId = @UserId AND ProjectId = @ProjectId",
-                new { UserId = dbUserId, ProjectId = dbProjId });
+            rows = conn.Query($@"SELECT * FROM {tableName} WHERE (UserId = @UserId {grantClause})",
+                new { UserId = dbUserId });
         }
         else
         {
-            rows = conn.Query($"SELECT * FROM {tableName} WHERE UserId = @UserId", new { UserId = dbUserId });
+            object dbProjId = ToDbId(conn, projectId);
+            rows = conn.Query($@"SELECT * FROM {tableName}
+                WHERE (UserId = @UserId {grantClause})
+                  AND ProjectId = @ProjectId",
+                new { UserId = dbUserId, ProjectId = dbProjId });
         }
         return rows.Select(r => JObject.Parse(JsonConvert.SerializeObject(r))).Cast<JObject>().ToList();
     }
@@ -356,7 +554,7 @@ public static class DatabasePersistence
         return JObject.Parse(JsonConvert.SerializeObject(row));
     }
 
-    // ── Reports (DB-backed UserReport) ─────────────────────────────────
+    // ── Reports (generic entity, same shape as Dashboards) ──────────────
 
     public static List<JObject> LoadReports(string userId)
         => LoadEntities(userId, "Reports");
@@ -406,8 +604,13 @@ public static class DatabasePersistence
         if (conn == null) return new List<JObject>();
 
         conn.Open();
-        object dbUserId = (conn is MySqlConnector.MySqlConnection || IsOracleConnection(conn)) ? userId : Guid.Parse(userId);
-        var rows = conn.Query("SELECT * FROM Projects WHERE UserId = @UserId ORDER BY CreatedAt",
+        object dbUserId = ToDbId(conn, userId);
+        // A project has no ProjectId column of its own (it IS the project), so membership
+        // is a direct grant on the project's own Id rather than ProjectVisibilityClause.
+        var rows = conn.Query($@"SELECT * FROM Projects
+            WHERE UserId = @UserId
+               OR Id IN (SELECT ResourceId FROM ResourceGrants WHERE ResourceType = '{ProjectResourceType}' AND GranteeUserId = @UserId)
+            ORDER BY CreatedAt",
             new { UserId = dbUserId });
         return rows.Select(r => JObject.Parse(JsonConvert.SerializeObject(r))).Cast<JObject>().ToList();
     }

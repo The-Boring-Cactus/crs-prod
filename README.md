@@ -23,7 +23,7 @@ backend, talking to whichever relational database you point it at.
   bar, pie, scatter, radar, etc. — rendered with ECharts or, optionally, Bokeh), data
   tables, tree tables, images, SQL-backed widgets, and script-backed widgets that can
   auto-refresh on an interval.
-- **Edit data directly.** A spreadsheet-style dataset editor for editing tabular
+- **Edit data directly.** A spreadsheet-style dataset editor (`MyExcel`) for editing tabular
   data by hand.
 - **Share dashboards publicly.** Generate a public share link that renders a read-only,
   unauthenticated view of a dashboard — including live SQL/script widgets and

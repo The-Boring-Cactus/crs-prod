@@ -47,7 +47,8 @@ import {
     Waves,
     Mail,
     Eye,
-    GripHorizontal
+    GripHorizontal,
+    UserPlus
 } from 'lucide-vue-next';
 import GridLayout from '@/components/draggable/GridLayout.vue';
 import GridItem from '@/components/draggable/GridItem.vue';
@@ -1541,6 +1542,60 @@ async function openShareDialog() {
     if (!dashboardId.value) await saveToServer();
     currentShareToken.value = layout.value.formvalues?.shareToken || '';
     showShareDialog.value = true;
+    loadResourceGrants();
+}
+
+// Per-user sharing: grants a specific account view/edit access to this dashboard,
+// independent of the public link above. Only the dashboard's owner (or an admin) can
+// manage this -- ListResourceGrants/ShareResource/RevokeResourceGrant all enforce that
+// server-side, so a non-owner who somehow opens this dialog just sees an empty list.
+const resourceGrants = ref([]);
+const loadingGrants = ref(false);
+const grantQuery = ref('');
+const grantPermission = ref('view');
+const addingGrant = ref(false);
+
+async function loadResourceGrants() {
+    if (!dashboardId.value) return;
+    loadingGrants.value = true;
+    try {
+        const result = await userStore.executeCommand('ListResourceGrants',
+            { resourceType: 'Dashboards', resourceId: dashboardId.value }, proxy.$socket);
+        resourceGrants.value = result?.Data || [];
+    } catch {
+        resourceGrants.value = [];
+    } finally {
+        loadingGrants.value = false;
+    }
+}
+
+async function addResourceGrant() {
+    if (!grantQuery.value.trim() || !dashboardId.value) return;
+    addingGrant.value = true;
+    try {
+        await userStore.executeCommand('ShareResource', {
+            resourceType: 'Dashboards', resourceId: dashboardId.value,
+            grantee: grantQuery.value.trim(), permission: grantPermission.value
+        }, proxy.$socket);
+        grantQuery.value = '';
+        await loadResourceGrants();
+        sonnerToast.success('Access granted');
+    } catch (error) {
+        sonnerToast.error('Failed to share', { description: error.message });
+    } finally {
+        addingGrant.value = false;
+    }
+}
+
+async function revokeResourceGrant(granteeUserId) {
+    try {
+        await userStore.executeCommand('RevokeResourceGrant',
+            { resourceType: 'Dashboards', resourceId: dashboardId.value, granteeUserId }, proxy.$socket);
+        await loadResourceGrants();
+        sonnerToast.success('Access revoked');
+    } catch (error) {
+        sonnerToast.error('Failed to revoke', { description: error.message });
+    }
 }
 
 async function enableSharing() {
@@ -3084,7 +3139,34 @@ function getSqlWidgetExportData(item) {
                 <DialogTitle class="flex items-center gap-2"><Share2 class="w-4 h-4" /> Share Dashboard</DialogTitle>
             </DialogHeader>
             <div class="py-4 space-y-4">
-                <div v-if="currentShareToken" class="space-y-4">
+                <div class="space-y-2">
+                    <label class="text-sm font-medium flex items-center gap-1.5"><UserPlus class="w-3.5 h-3.5" /> Share with people</label>
+                    <div class="flex gap-2">
+                        <Input v-model="grantQuery" placeholder="Username or email" @keyup.enter="addResourceGrant" class="text-sm" />
+                        <select v-model="grantPermission" class="h-9 rounded-md border border-input bg-transparent px-2 text-sm">
+                            <option value="view">Can view</option>
+                            <option value="edit">Can edit</option>
+                        </select>
+                        <Button variant="outline" size="icon" @click="addResourceGrant" :disabled="!grantQuery.trim() || addingGrant" title="Add">
+                            <RefreshCw v-if="addingGrant" class="w-4 h-4 animate-spin" /><UserPlus v-else class="w-4 h-4" />
+                        </Button>
+                    </div>
+                    <div v-if="resourceGrants.length" class="space-y-1 pt-1">
+                        <div v-for="grant in resourceGrants" :key="grant.granteeUserId || grant.GranteeUserId"
+                             class="flex items-center justify-between text-xs bg-muted/40 rounded px-2 py-1.5">
+                            <div class="min-w-0">
+                                <span class="font-medium">{{ grant.fullName || grant.FullName || grant.username || grant.Username }}</span>
+                                <span class="text-muted-foreground ml-1">({{ grant.permission || grant.Permission }})</span>
+                            </div>
+                            <button class="text-muted-foreground hover:text-destructive shrink-0" @click="revokeResourceGrant(grant.granteeUserId || grant.GranteeUserId)" title="Revoke access">
+                                <X class="w-3.5 h-3.5" />
+                            </button>
+                        </div>
+                    </div>
+                    <p v-else-if="!loadingGrants" class="text-xs text-muted-foreground">Not shared with anyone yet.</p>
+                </div>
+
+                <div v-if="currentShareToken" class="space-y-4 border-t pt-4">
                     <div class="space-y-2">
                         <label class="text-sm font-medium">Public Link</label>
                         <div class="flex gap-2">
@@ -3103,9 +3185,9 @@ function getSqlWidgetExportData(item) {
                         </Button>
                     </div>
                 </div>
-                <div v-else class="text-center py-4">
+                <div v-else class="text-center py-4 border-t pt-4">
                     <Lock class="w-8 h-8 mx-auto mb-2 text-muted-foreground" />
-                    <p class="text-sm text-muted-foreground">This dashboard is private. Generate a link to share it publicly.</p>
+                    <p class="text-sm text-muted-foreground">No public link yet. Generate one to share view access with anyone, without requiring an account.</p>
                 </div>
             </div>
             <DialogFooter>

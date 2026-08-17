@@ -13,6 +13,14 @@ namespace Server.Core;
 
 public class PublicController
 {
+    // Public share links are the highest-traffic, most latency-sensitive path (anonymous
+    // viewers, no session, potentially many concurrent visits to one popular dashboard), so
+    // every query-executing endpoint below runs through HeadlessQueryExecutor's cached path
+    // (the same ReportsCache the authenticated in-app ExecuteSql path already uses) instead
+    // of hitting the database on every single page view. Shorter than the 15-minute default
+    // used elsewhere since a public dashboard is often watched for near-live status.
+    private static readonly TimeSpan PublicQueryCacheAge = TimeSpan.FromMinutes(2);
+
     // ── Public dashboard (includes variable definitions so the view needs only one request) ──
 
     [ResourceMethod("dashboard/:token")]
@@ -64,7 +72,7 @@ public class PublicController
             throw new ProviderException(ResponseStatus.BadRequest, "Widget not found or not a SQL/Data Model widget");
 
         if (widgetType == "DataModelWidget")
-            return RunPublicDataModelWidget(userId, widget);
+            return await RunPublicDataModelWidget(userId, widget);
 
         var databaseId = widget["databaseId"]?.ToString() ?? "";
         var sqlCode    = widget["sqlCode"]?.ToString()    ?? "";
@@ -74,35 +82,16 @@ public class PublicController
 
         var substituted = SubstituteVariables(sqlCode, request.Variables ?? new Dictionary<string, string>());
 
-        using var conn = OpenOwnerConnection(userId, databaseId);
-        conn.Open();
+        var connInfo = GetOwnerConnectionInfo(userId, databaseId);
+        var cached = await HeadlessQueryExecutor.RunQueryCachedAsync(connInfo, substituted, PublicQueryCacheAge);
 
-        var results   = conn.Query(substituted).ToList();
-        var rowList   = new List<Dictionary<string, object>>();
-        List<string>? columnNames = null;
-
-        foreach (dynamic r in results)
-        {
-            Dictionary<string, object> rd = r is IDictionary<string, object> d
-                ? new Dictionary<string, object>(d)
-                : JsonConvert.DeserializeObject<Dictionary<string, object>>(JsonConvert.SerializeObject(r))
-                  ?? new Dictionary<string, object>();
-
-            columnNames ??= rd.Keys.ToList();
-            rowList.Add(rd);
-        }
-
-        var columns = (columnNames ?? new List<string>())
-            .Select(c => new { field = c, header = c })
-            .ToArray();
-
-        return new { rows = rowList, columns };
+        return new { rows = cached.Rows, columns = cached.Columns };
     }
 
     // Runs a DataModelWidget's stored query against the dashboard owner's Data Model,
     // mirroring PublicController.LoadDataModelRows / WebSocketManager's "RunDataModelQuery"
     // command but scoped to the dashboard *owner's* userId (the viewer never has one).
-    private static object RunPublicDataModelWidget(string userId, JObject widget)
+    private static async Task<object> RunPublicDataModelWidget(string userId, JObject widget)
     {
         var modelId = widget["modelId"]?.ToString() ?? "";
         var queryObj = widget["query"] as JObject ?? new JObject();
@@ -117,19 +106,9 @@ public class PublicController
         var dmRequest = DataModelQueryBuilder.ParseRequest(queryObj);
         var (sql, sqlParams) = DataModelQueryBuilder.Build(model, dmRequest);
 
-        using var conn = OpenOwnerConnection(userId, model.ConnectionId);
-        conn.Open();
-        var flatResults = conn.Query(sql, sqlParams).ToList();
-
-        var flatRows = new List<Dictionary<string, object>>();
-        foreach (dynamic r in flatResults)
-        {
-            Dictionary<string, object> rd = r is IDictionary<string, object> d
-                ? new Dictionary<string, object>(d)
-                : JsonConvert.DeserializeObject<Dictionary<string, object>>(JsonConvert.SerializeObject(r))
-                  ?? new Dictionary<string, object>();
-            flatRows.Add(rd);
-        }
+        var connInfo = GetOwnerConnectionInfo(userId, model.ConnectionId);
+        var cached = await HeadlessQueryExecutor.RunQueryCachedAsync(connInfo, sql, PublicQueryCacheAge, sqlParams);
+        var flatRows = cached.Rows;
 
         if (dmRequest.Pivot != null)
         {
@@ -278,15 +257,21 @@ public class PublicController
         return result;
     }
 
-    // Creates and opens a connection belonging to the dashboard owner.
-    private static System.Data.IDbConnection OpenOwnerConnection(string userId, string connectionId)
+    // The dashboard owner's connection config, unopened -- for callers that hand off to
+    // HeadlessQueryExecutor (which builds and manages its own connection per call, and can
+    // cache the result). Callers that need a live IDbConnection object directly (registering
+    // it into a CodeEngine) still go through OpenOwnerConnection/BuildConnection below.
+    private static JObject GetOwnerConnectionInfo(string userId, string connectionId)
     {
         var connections = DatabasePersistence.LoadDatabaseConnections(userId);
-        var cfg = connections.FirstOrDefault(c =>
+        return connections.FirstOrDefault(c =>
             (c["id"]?.ToString() ?? c["Id"]?.ToString()) == connectionId)
             ?? throw new ProviderException(ResponseStatus.NotFound, "Database connection not found");
-        return BuildConnection(cfg);
     }
+
+    // Creates and opens a connection belonging to the dashboard owner.
+    private static System.Data.IDbConnection OpenOwnerConnection(string userId, string connectionId)
+        => BuildConnection(GetOwnerConnectionInfo(userId, connectionId));
 
     private static System.Data.IDbConnection BuildConnection(JObject cfg)
     {
@@ -455,28 +440,17 @@ public class PublicController
         }
     }
 
-    // Runs a query and returns the first column of every row as a string list.
+    // Runs a query and returns the first column of every row as a string list. Used by both
+    // GetPublicSelectOptions and BuildVariableDefs -- the latter runs on every single public
+    // dashboard page view (once per SQL-sourced dropdown variable), so this is one of the
+    // highest-value places to cache.
     private static async Task<List<string>> ResolveQueryFirstColumn(string userId, string connectionId, string query)
     {
         try
         {
-            using var conn = OpenOwnerConnection(userId, connectionId);
-            conn.Open();
-            var rows = conn.Query(query).ToList();
-            var opts = new List<string>();
-            foreach (dynamic row in rows)
-            {
-                Dictionary<string, object> rd = row is IDictionary<string, object> d
-                    ? new Dictionary<string, object>(d)
-                    : JsonConvert.DeserializeObject<Dictionary<string, object>>(JsonConvert.SerializeObject(row))
-                      ?? new Dictionary<string, object>();
-                if (rd.Count > 0)
-                {
-                    Dictionary<string, object> typed = rd;
-                    opts.Add(typed.Values.First()?.ToString() ?? "");
-                }
-            }
-            return await Task.FromResult(opts);
+            var connInfo = GetOwnerConnectionInfo(userId, connectionId);
+            var cached = await HeadlessQueryExecutor.RunQueryCachedAsync(connInfo, query, PublicQueryCacheAge);
+            return cached.Rows.Where(rd => rd.Count > 0).Select(rd => rd.Values.First()?.ToString() ?? "").ToList();
         }
         catch (Exception ex)
         {

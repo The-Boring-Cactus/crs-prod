@@ -17,11 +17,17 @@ public class DataSourceManager
         string connectionKey,
         string sql,
         object parameters = null,
-        TimeSpan? cacheAge = null)
+        TimeSpan? cacheAge = null,
+        bool forceRefresh = false)
     {
         var queryKey = GenerateQueryKey(connectionKey, sql, parameters);
         var maxAge = cacheAge ?? TimeSpan.FromMinutes(15);
-        
+
+        // A caller that explicitly asked to bypass the cache (e.g. SQL Editor's "Force
+        // Refresh" button) gets a guaranteed live run by evicting the entry first, rather
+        // than needing a separate uncached code path.
+        if (forceRefresh) _cache.InvalidateQuery(queryKey);
+
         return await _cache.GetOrExecuteAsync(queryKey, async () =>
         {
             var connection = GetConnection(connectionKey);
@@ -55,13 +61,5 @@ public class DataSourceManager
     public void AddConnection(string key, IDbConnection connection)
     {
         _connections[key] = connection;
-    }
-
-    public async Task<object> ExecuteQueryWithProgressAsync(string reportConnectionKey, string reportSqlQuery, Dictionary<string, object> reportParameters, TimeSpan reportCacheAge, IProgress<QueryExecutionStatus> progress, CancellationToken cancellationToken)
-    {
-        var connection = GetConnection(reportConnectionKey);
-
-        var command = new CommandDefinition(reportSqlQuery,reportParameters, null, reportCacheAge.Seconds,null, CommandFlags.Buffered, cancellationToken );
-        return await connection.QueryFirstAsync(command);
     }
 }
